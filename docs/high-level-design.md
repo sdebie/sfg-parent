@@ -92,15 +92,14 @@ flowchart LR
   end
 
   subgraph Platform
-    MIG["DB migrations<br/>(sfg-infra: Flyway)"]
     IDP["Identity provider<br/>(Keycloak, OIDC)"]
-    API["SFG API<br/>(sfg-backend: Quarkus)"]
+    API["SFG API<br/>(sfg-backend: Quarkus)<br/>runs sfg-infra Flyway migrations at startup"]
     WRK["Document workers<br/>(same codebase, worker profile)"]
     AV["Malware scanner<br/>(ClamAV)"]
     DB[("PostgreSQL<br/>app data + audit log")]
     OBJ[("Object storage<br/>encrypted documents")]
     KMS["Key management<br/>(cloud KMS / Vault)"]
-    LLM["Local LLM server<br/>(vLLM on GPU, no internet egress)"]
+    LLM["Local LLM server<br/>(Ollama for POC, vLLM later; no internet egress)"]
   end
 
   subgraph External["Third parties (contracted, minimal data)"]
@@ -112,7 +111,6 @@ flowchart LR
   MOB --> RP
   RP -- "REST /api/v1<br/>GraphQL /api/graphql" --> API
   RP --> IDP
-  MIG --> DB
   API --> DB
   API --> OBJ
   API --> KMS
@@ -131,13 +129,13 @@ flowchart LR
 |---|---|---|
 | Backend | Quarkus (Java 21 LTS) | Stated in project setup; strong OIDC, security and native-image support |
 | API style | REST (`/api/v1`, OpenAPI) **and** GraphQL (`/api/graphql`, SmallRye GraphQL) over one shared service layer | REST for simple, cacheable and file-upload calls; GraphQL lets the X-ray and dashboard screens fetch exactly what they need in one round trip |
-| Schema migrations | Flyway, owned by the separate **sfg-infra** repo | Schema changes are reviewed and versioned on their own; Hibernate never generates DDL |
+| Schema migrations | Flyway, owned by the separate **sfg-infra** repo, applied by the backend at startup | Schema changes are reviewed and versioned on their own; Hibernate never generates DDL, only validates |
 | Database | PostgreSQL 16 | Relational integrity for financial data; row-level security for tenant separation |
 | Document storage | S3-compatible object storage (MinIO locally, cloud bucket in pilot) | Keeps large binaries out of the DB; per-object encryption and lifecycle rules |
 | Identity | Keycloak (self-hosted) **[Decision]** | Open source, OIDC/PKCE, MFA, runs in docker-compose; avoids per-user SaaS fees and keeps identity data in-region |
 | Async jobs | PostgreSQL-backed job queue (e.g. Quartz/JobRunr or `SKIP LOCKED` table) **[Decision]** | Pilot volumes are tiny; avoids running Kafka/RabbitMQ |
 | Malware scanning | ClamAV sidecar | Uploaded files are untrusted input |
-| AI | Local open-weight LLM served by vLLM (Ollama for dev), called via Quarkus LangChain4j with read-only tools **[Decision]** | Customers can ask questions about their data without any financial data going to a cloud AI (section 7) |
+| AI | Local open-weight LLM, served by **Ollama for the POC** (decided) and swappable to vLLM by configuration, called via Quarkus LangChain4j with read-only tools | Customers can ask questions about their data without any financial data going to a cloud AI (section 7) |
 | Hosting | Containers in a South African cloud region (e.g. AWS af-south-1 or Azure South Africa North) **[Open] Q1** | Keeps personal information in-country, simplifies POPIA section 72 |
 
 ---
@@ -149,7 +147,7 @@ All repositories live at `github.com/sdebie`.
 | Repo | Purpose | Main contents |
 |---|---|---|
 | **sfg-parent** | Project documentation and cross-repo decisions | This HLD, architecture decision records (`docs/adr/`), threat model, security and POPIA control register, roadmap |
-| **sfg-infra** | Database schema and local database | Flyway migrations (`db/migration`), dev seed data (`db/seed/dev`), a `docker-compose.yml` for a local PostgreSQL, and a small Quarkus app that applies the migrations |
+| **sfg-infra** | Database schema and local database | Flyway migrations (`db/migration`), dev seed data (`db/seed/dev`), a `docker-compose.yml` for a local PostgreSQL. Publishes the migrations as a Maven jar that the backend applies at startup |
 | **sfg-setup** | Run the whole system locally and for the pilot | `docker-compose.yml`, env templates, startup and seed scripts. Compose **pulls** published images (details deferred) |
 | **sfg-common** | Shared Java library and owner of the data model | Enums, JPA entities, DTOs and Panache repositories, published as a Maven artifact |
 | **sfg-backend** | The SFG API and document workers | Quarkus application (REST + GraphQL), services, calculation engine. Uses the entities, DTOs and repositories from sfg-common; no DDL |
@@ -181,7 +179,7 @@ A single Quarkus application, deployed in two roles from the same image: **api**
 
 Notes:
 - **Calculation engine discipline.** `calc` has no dependency on frameworks or AI. Each run records the engine version and a hash of its inputs, so any figure in a report can be reproduced. Golden test vectors (agreed with Finance Blueprint) gate every change.
-- **Persistence.** Hibernate ORM with Panache, with `quarkus.hibernate-orm.database.generation=none`. Entities, enums and repositories come from sfg-common (3.4); the DDL comes only from sfg-infra (3.6). All workspace-owned tables carry `workspace_id`.
+- **Persistence.** Hibernate ORM with Panache, with `quarkus.hibernate-orm.database.generation=none`. Entities, enums and repositories come from sfg-common (3.4); the DDL comes only from sfg-infra (3.6), which the backend applies with Flyway at startup; Hibernate runs in `validate` mode in tests. All workspace-owned tables carry `workspace_id`.
 - **APIs.** Two front doors onto the same services:
   - **REST/JSON** under `/api/v1` (JAX-RS), with OpenAPI generated by SmallRye OpenAPI at `/q/openapi` and published to sfg-common. Used for uploads, downloads (reports), commands and anything that benefits from plain HTTP semantics.
   - **GraphQL** at `/api/graphql` (SmallRye GraphQL). Used for read-heavy screens such as the Financial X-ray, goals and dashboards. Mutations are allowed where they mirror a REST command.
@@ -221,25 +219,27 @@ on the Java side.
 
 How it fits with the other repos:
 - **Build and publish:** a Maven jar (`org.sfg.common:sfg-common`) with a Jandex index so Quarkus apps discover its entities and repository beans. `build.yml` builds it on PRs; `publish-common.yml` deploys it to GitHub Packages on push to `main`.
-- **sfg-backend** depends on it as a Maven dependency (or a local `mvn install` during development) and keeps only services, mappers and API resources. Backend CI reads the package from GitHub Packages with the workflow's own `GITHUB_TOKEN` (`packages: read`), so no extra secret is needed. sfg-common must be published before a backend change that needs it can pass CI.
-- **sfg-infra** holds the Flyway migrations (DDL). sfg-common entities and sfg-infra migrations must change together: a change that adds a column lands as an sfg-infra migration plus the matching sfg-common entity change, released in that order. Because backend CI no longer runs against the migrations (3.6), drift between entities and migrations is only caught when tests run locally with sfg-infra checked out. **[Decision]** Add a drift check before the pilot: for example, sfg-infra's CI applies its migrations and runs Hibernate schema *validation* with the published sfg-common jar.
+- **sfg-backend** depends on it as a Maven dependency (or a local `mvn install` during development) and keeps only services, mappers and API resources. Backend CI reads the package from GitHub Packages (see 10 for the token it needs). sfg-common must be published before a backend change that needs it can pass CI.
+- **sfg-infra** holds the Flyway migrations (DDL). sfg-common entities and sfg-infra migrations must change together: a change that adds a column lands as an sfg-infra migration plus the matching sfg-common entity change, released in that order. Drift is caught in backend CI: tests apply the real migrations and Hibernate validates the entities against them, so a missing or renamed column fails the build.
 - **Web and mobile** cannot use a Java library. Their TypeScript types come from the backend's OpenAPI document and GraphQL schema instead; where that generated client lives is **[Open] Q17**.
 
 ### 3.5 sfg-setup
 
-- `docker-compose.yml` that pulls published images from Docker Hub for: `backend-api`, `backend-worker`, `frontend`, `infra` (runs the Flyway migrations, then exits), `postgres`, `keycloak`, `minio`, `clamav`, and for local use only `mailpit` (fake email). The backend starts only after the migration container has finished successfully.
+- `docker-compose.yml` that pulls published images from Docker Hub for: `backend-api`, `backend-worker`, `frontend`, `postgres`, `keycloak`, `minio`, `clamav`, and for local use only `mailpit` (fake email). The backend applies pending migrations itself when it starts (3.6).
 - `.env.example` with every setting documented; no real secrets committed.
-- Startup scripts: create buckets, import the Keycloak realm, load synthetic seed data. Migrations are run by sfg-infra, not by the backend; today Shawn starts sfg-infra through sfg-setup manually, and pulling a published sfg-infra image is deferred.
+- Startup scripts: create buckets, import the Keycloak realm, load synthetic seed data. Migrations need no separate step because the backend applies them on startup; the sfg-infra runner can still load the dev seed.
 - The same compose definition can run a single-host pilot environment with production overrides, or be translated to the chosen cloud platform later (details deferred, see section 10).
 
 ### 3.6 sfg-infra (database schema)
 
 - **Owns the PostgreSQL schema.** Versioned Flyway migrations in `src/main/resources/db/migration` (starting with `V1.0.0__initial_schema.sql`) and synthetic seed data in `db/seed/dev`, which is never applied outside dev and test.
 - **Local database:** its `docker-compose.yml` starts PostgreSQL 16 for development (`sfg_db`, user `sfg`).
-- **Applying migrations:** a small Quarkus application with Flyway applies them. The same image runs as a one-shot job before the backend starts in compose and in the pilot. **[Decision]** Migrations run under a dedicated schema-owner role; the backend connects with a lower-privilege application role that cannot change the schema. This is also where row-level security policies (6.2) will live.
-- **Relationship to sfg-common:** sfg-infra owns the DDL, sfg-common owns the entities that map it (3.4). Both must agree (see the drift check in 3.4).
-- **How it is run today:** Shawn runs sfg-infra (database plus migrations) through sfg-setup.
-- **How the backend tests use it:** Quarkus Dev Services starts a throwaway PostgreSQL. When sfg-infra is checked out next to the backend (`../sfg-infra`, overridable with `-Dsfg-infra.dir`), the tests apply the real Flyway migrations. When it isn't, as in CI, the `no-sfg-infra` Maven profile lets Hibernate generate the schema instead. Tests create their own data rather than relying on the dev seed. Backend CI therefore needs no access to sfg-infra.
+- **Packaging:** sfg-infra publishes its migrations to GitHub Packages as a Maven artifact (`org.sfg.infra:sfg-infra:<version>:migrations`).
+- **Applying migrations:** sfg-backend depends on that artifact and runs Flyway at startup in every profile (`quarkus.flyway.migrate-at-start=true`, `locations=classpath:db/migration`). `ignore-migration-patterns=repeatable:missing` lets a database that holds the sfg-infra dev seed (`R__dev_seed`) still validate. sfg-infra's own runner is still useful for loading the dev seed locally. Row-level security policies (6.2) will also arrive as sfg-infra migrations.
+- **Database roles:** because the backend now applies migrations, its database user owns the tables. A table owner bypasses row-level security unless the policy is forced, so RLS migrations must use `ALTER TABLE ... FORCE ROW LEVEL SECURITY`. **[Decision]** Before the pilot, consider splitting roles: a schema-owner role used only for migrations and a lower-privilege application role for normal queries.
+- **Relationship to sfg-common:** sfg-infra owns the DDL, sfg-common owns the entities that map it (3.4). Backend tests catch any drift.
+- **How the backend tests use it:** Quarkus Dev Services starts a throwaway PostgreSQL 16, Flyway applies the real migrations from the sfg-infra artifact, and Hibernate runs in `validate` mode. Tests create their own data rather than relying on the dev seed. No sibling checkout is needed.
+- **Access:** sfg-infra is private, and GitHub's built-in workflow token can't read another private repo's package, so backend CI needs a `PACKAGES_READ_TOKEN` secret (a classic PAT with `read:packages`), or sfg-infra must be made public.
 - **Rules for schema changes:** migrations are forward-only and never edited after merge; a backend change that needs a new column merges the sfg-infra migration first; destructive changes go through expand-then-contract across two releases.
 
 ---
@@ -351,7 +351,7 @@ Mapped to brief section 4. A formal threat model (STRIDE per data flow above) is
 
 ### 6.2 Authorization and personal/business separation
 - Every request runs in a **workspace context**; the backend checks the caller's membership and role on that workspace for every call (deny by default).
-- **Defence in depth:** PostgreSQL row-level security on all workspace-owned tables, with the workspace id set per transaction, so a missed check in code still cannot return another workspace's rows.
+- **Defence in depth:** PostgreSQL row-level security on all workspace-owned tables (forced, so it also applies to the table owner; see 3.6), with the workspace id set per transaction, so a missed check in code still cannot return another workspace's rows.
 - Object storage keys are prefixed by workspace and never guessable; documents are only served through the API after an authorization check (no public URLs).
 - Explicit UI separation between personal and business modes; no cross-workspace aggregation in release 1.
 - Operator/admin access is separate (own realm or role, MFA, IP-restricted), least privilege, and every access is audited.
@@ -409,8 +409,20 @@ It replaces the earlier "explanations only" scope for AI and the plan to defer A
 **Personal and business financial data never goes to a cloud AI service.** The language model runs on
 infrastructure SFG controls, in South Africa, on a private network with no internet access.
 
-- **Serving:** [vLLM](https://github.com/vllm-project/vllm) in the pilot and staging (efficient batching, OpenAI-compatible API, tool-calling support). [Ollama](https://ollama.com) on developer machines (for example a Mac with Apple Silicon) and in the local compose stack. Both expose the same OpenAI-compatible API, so switching is configuration only.
-- **Integration:** the backend uses the [Quarkus LangChain4j](https://docs.quarkiverse.io/quarkus-langchain4j/dev/) extension with its OpenAI-compatible client pointed at the local server. Tools are plain Java methods on backend services.
+- **Serving, POC (decided):** [Ollama](https://ollama.com), on a developer machine (for example a Mac with Apple Silicon) or a single GPU server. It is the quickest way to get a local model answering questions.
+- **Serving, later:** [vLLM](https://github.com/vllm-project/vllm) once the pilot needs better throughput and batching, or any other server with an OpenAI-compatible API. Whether and when to switch is decided from the POC results.
+- **Swappable by configuration [Decision]:** the backend uses the [Quarkus LangChain4j](https://docs.quarkiverse.io/quarkus-langchain4j/dev/) extension with its **OpenAI-compatible** client (`quarkus-langchain4j-openai`), not an Ollama-specific client. Ollama and vLLM both serve that API, so changing the serving engine or the model means changing only configuration, for example:
+
+  ```properties
+  # POC: Ollama
+  quarkus.langchain4j.openai.base-url=${LLM_BASE_URL:http://localhost:11434/v1}
+  quarkus.langchain4j.openai.chat-model.model-name=${LLM_MODEL:qwen3:14b}
+  # Later: vLLM, same keys
+  # LLM_BASE_URL=http://llm:8000/v1   LLM_MODEL=Qwen/Qwen3-32B
+  ```
+
+  Rules that keep it swappable: no code depends on Ollama-specific APIs or model-specific prompt formats; prompts, tools and guardrails live in the `assistant` module, not in the server; and the evaluation set (7.7) is rerun on every change of server or model, because tool-calling quality differs between models.
+- **Integration:** tools are plain Java methods on backend services, exposed to the model through LangChain4j's tool support.
 - **Model choice:** open-weight models with strong tool calling and a permissive commercial licence, chosen by running the evaluation set (7.7) on SFG's own synthetic data. Candidates to evaluate, as of late 2026:
 
 | Size class | Example candidates | Typical GPU memory (quantised) | Fit |
@@ -421,7 +433,7 @@ infrastructure SFG controls, in South Africa, on a private network with no inter
 
 Licences must allow commercial use (for example Apache 2.0 for Qwen3, gpt-oss and Mistral Small; Llama has its own community licence). Model weights are downloaded once from the official source, checksummed and stored in SFG's own registry; the serving container never pulls models at runtime.
 
-- **Capacity for the pilot:** 100 participants means a handful of concurrent questions at peak. One GPU running a medium model with vLLM is enough, with a target of first words in under 2 seconds and a full answer in under 15 seconds. Where the GPU is hosted is **[Open] Q18**: GPU instances in South African cloud regions are limited, so options are a GPU VM in-region if available, a dedicated GPU server in a South African data centre, or on-premises hardware.
+- **Capacity for the pilot:** 100 participants means a handful of concurrent questions at peak. One GPU running a medium model is enough (Ollama for the POC, vLLM if concurrency needs it), with a target of first words in under 2 seconds and a full answer in under 15 seconds. Where the GPU is hosted is **[Open] Q18**: GPU instances in South African cloud regions are limited, so options are a GPU VM in-region if available, a dedicated GPU server in a South African data centre, or on-premises hardware.
 
 ### 7.3 How a question is answered
 
@@ -431,7 +443,7 @@ sequenceDiagram
   actor C as Customer
   participant App as Web / Mobile
   participant AS as assistant module (backend)
-  participant LLM as Local LLM (vLLM)
+  participant LLM as Local LLM (Ollama / vLLM)
   participant T as Tools (read-only services)
   participant CALC as calc engine
   participant DB as PostgreSQL
@@ -476,7 +488,7 @@ Key rules:
 - **`assistant` module (sfg-backend):** conversation API, orchestration loop (LangChain4j AI service with tools), tool registry, guardrails, streaming responses (Server-Sent Events from a REST endpoint), per-user rate limits and token budgets.
 - **Conversation store:** conversations and messages per workspace in PostgreSQL (entities in sfg-common, tables in sfg-infra), encrypted at rest, subject to the retention schedule (Q3) and deleted with the workspace.
 - **Knowledge base:** reviewed guidance articles (budgeting, saving, debt, SME cash-flow practice) embedded with a local embedding model and stored with pgvector. No customer data in this index.
-- **LLM server:** vLLM container (Ollama locally) on a GPU node, reachable only from the backend.
+- **LLM server:** Ollama for the POC, swappable to vLLM by configuration (7.2), on a GPU node or developer machine, reachable only from the backend.
 - **Clients:** an "Ask SFG" screen in web and mobile with suggested questions, streamed answers and figure cards. Available in both personal and business workspaces, scoped to the one in use.
 
 ### 7.5 Safeguards
@@ -561,14 +573,13 @@ flowchart TB
   end
   subgraph Pilot["Pilot environment (South African region)"]
     LB["TLS load balancer / WAF"] --> FE["frontend (nginx)"]
-    MG["infra (Flyway, one-shot)"] --> PG
     LB --> BE["backend-api"]
     BE --> WK["backend-worker"]
     BE --> PG[("Managed PostgreSQL")]
     BE --> S3[("Object storage")]
     BE --> KC["Keycloak"]
     WK --> CL["ClamAV"]
-    BE --> AI["vLLM on GPU node<br/>(private, no egress)"]
+    BE --> AI["LLM server on GPU node<br/>(Ollama POC / vLLM; private, no egress)"]
   end
   IMG --> DC
   IMG --> Pilot
@@ -576,10 +587,11 @@ flowchart TB
 
 - **Environments:** local (compose, synthetic data), test/staging (synthetic data only), pilot (real data, only after go/no-go).
 - **CI pattern (per repo, GitHub Actions):**
-  - `build.yml` on every pull request: build and run the tests. sfg-backend's tests use a Hibernate-generated schema in CI (3.6), so CI needs no access to sfg-infra; it reads sfg-common from GitHub Packages with `GITHUB_TOKEN`.
+  - `build.yml` on every pull request: build and run the tests. sfg-backend's tests apply the real sfg-infra migrations and validate the entities against them (3.6). It reads sfg-common and the sfg-infra migrations artifact from GitHub Packages with `-U` (latest snapshots), which needs the `PACKAGES_READ_TOKEN` secret while sfg-infra is private.
+  - sfg-infra: publishes the migrations jar to GitHub Packages.
   - sfg-common: `publish-common.yml` deploys the jar to GitHub Packages on push to `main`.
   - `build-<component>.yml` on push to `main`: compile with Maven (or the JS build), build a small runtime image from a `Dockerfile.runtime` (for the backend, `eclipse-temurin:21-jre-alpine` with the pre-built `target/quarkus-app`), and push it to **Docker Hub** as `<DOCKERHUB_USERNAME>/sfg-<component>:latest` and `:<git sha>`. Needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets.
-  - Images: `sfg-backend`, `sfg-infra`, `sfg-frontend`. Mobile builds go to the app stores instead.
+  - Images: `sfg-backend`, `sfg-frontend`. sfg-infra ships as a Maven artifact, not an image. Mobile builds go to the app stores instead.
 - **Image hygiene [Decision]:** Docker Hub repositories should be **private**, since they hold the application (**[Open] Q15**). Images get a vulnerability scan (e.g. Trivy) before push. sfg-setup pins the `:<sha>` tag for anything beyond local dev; `:latest` is for local convenience only.
 - **Pilot hosting:** container platform in a South African region with managed PostgreSQL, object storage and KMS, plus one GPU node for the LLM server; exact platform deferred (**[Open] Q1**, GPU hosting **Q18**). Locally, sfg-setup adds an `ollama` service (or uses Ollama installed on the host, which is faster on a Mac). A single-host compose deployment is acceptable for staging.
 - **Mobile distribution:** TestFlight (iOS) and Google Play internal/closed testing for pilot participants.
