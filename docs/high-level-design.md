@@ -12,6 +12,13 @@ components, data flows and controls, and lists the decisions that still need an 
 **[Decision]** are proposals made here that should be confirmed; items marked **[Open]** are listed in
 [section 12](#12-open-questions).
 
+> **Product focus: AI is the main driver.** What sets SFG apart is that a customer, above all a small
+> business owner, can ask questions about their own finances in plain language and get trustworthy,
+> evidence-backed answers ("How can I save money next month?"). That assistant, **Ask SFG**, is the centre
+> of the product, not an add-on. Uploads, extraction, customer review and the deterministic calculation
+> engine exist to give it accurate, confirmed data and reliable numbers. The AI runs on local models only,
+> so customer financial data never goes to a cloud AI service. See [section 7](#7-ai-assistant-ask-sfg-and-safeguards).
+
 ---
 
 ## 1. Goals and constraints
@@ -19,6 +26,11 @@ components, data flows and controls, and lists the decisions that still need an 
 ### 1.1 What the first release must do
 
 From the brief (section 3):
+
+**Ask SFG, the AI assistant (core driver)**
+- Customers, especially small business owners, ask questions about their own data in plain language ("How can I save money next month?", "Why was March negative?", "What if I cut fuel by 15%?") and get answers grounded in their figures, with the evidence shown.
+- Available in both personal and business workspaces. Runs on local models only, so financial data never goes to a cloud AI (section 7).
+- The brief frames AI as assisting with explanations and guidance (3.3); Ask SFG does exactly that, with the calculation engine producing every number.
 
 **Personal financial health**
 - Onboarding and profile setup.
@@ -35,9 +47,6 @@ From the brief (section 3):
 - Basic business cash-flow visibility and goal planning.
 - Separation of personal and business records, including when one person uses both.
 - Limited decision support suitable for a controlled pilot.
-
-**Ask SFG (core driver)**
-- Customers, especially small business owners, ask questions about their own data in plain language ("How can I save money next month?") and get answers grounded in their figures. AI runs on local models only, so financial data never goes to a cloud AI (section 7).
 
 ### 1.2 Design principles (from brief 3.3 and section 4)
 
@@ -65,6 +74,11 @@ From the brief (section 3):
 SFG is built as **one backend service (a modular monolith) with two clients**. For a pilot of this size,
 a single deployable backend with strong internal module boundaries is cheaper to secure, test and operate
 than microservices, and modules can be split out later if needed. **[Decision]**
+
+The **Ask SFG assistant** is a first-class part of this architecture: every financial feature in the
+backend (cash flow, spending, debts, goals, SME receivables and payables, scenarios) is built as a service
+that the app screens **and** the assistant's tools both call. A feature is not done until the assistant
+can use it.
 
 ```mermaid
 flowchart LR
@@ -206,15 +220,16 @@ on the Java side.
 - **No HTTP and no business logic:** resources, services, the calculation engine and guidance stay in sfg-backend.
 
 How it fits with the other repos:
-- **sfg-backend** depends on it as a Maven dependency, versioned, published to GitHub Packages (or a local `mvn install` during development). Backend CI then needs a read token for the package registry.
-- **sfg-infra** holds the Flyway migrations (DDL). sfg-common entities and sfg-infra migrations must change together: a change that adds a column lands as an sfg-infra migration plus the matching sfg-common entity change, released in that order. sfg-common's tests run against a PostgreSQL built from the sfg-infra migrations, with Hibernate schema *validation* turned on, so any drift fails the build.
+- **Build and publish:** a Maven jar (`org.sfg.common:sfg-common`) with a Jandex index so Quarkus apps discover its entities and repository beans. `build.yml` builds it on PRs; `publish-common.yml` deploys it to GitHub Packages on push to `main`.
+- **sfg-backend** depends on it as a Maven dependency (or a local `mvn install` during development) and keeps only services, mappers and API resources. Backend CI reads the package from GitHub Packages with the workflow's own `GITHUB_TOKEN` (`packages: read`), so no extra secret is needed. sfg-common must be published before a backend change that needs it can pass CI.
+- **sfg-infra** holds the Flyway migrations (DDL). sfg-common entities and sfg-infra migrations must change together: a change that adds a column lands as an sfg-infra migration plus the matching sfg-common entity change, released in that order. Because backend CI no longer runs against the migrations (3.6), drift between entities and migrations is only caught when tests run locally with sfg-infra checked out. **[Decision]** Add a drift check before the pilot: for example, sfg-infra's CI applies its migrations and runs Hibernate schema *validation* with the published sfg-common jar.
 - **Web and mobile** cannot use a Java library. Their TypeScript types come from the backend's OpenAPI document and GraphQL schema instead; where that generated client lives is **[Open] Q17**.
 
 ### 3.5 sfg-setup
 
 - `docker-compose.yml` that pulls published images from Docker Hub for: `backend-api`, `backend-worker`, `frontend`, `infra` (runs the Flyway migrations, then exits), `postgres`, `keycloak`, `minio`, `clamav`, and for local use only `mailpit` (fake email). The backend starts only after the migration container has finished successfully.
 - `.env.example` with every setting documented; no real secrets committed.
-- Startup scripts: create buckets, import the Keycloak realm, load synthetic seed data. Migrations are run by the sfg-infra image, not by the backend.
+- Startup scripts: create buckets, import the Keycloak realm, load synthetic seed data. Migrations are run by sfg-infra, not by the backend; today Shawn starts sfg-infra through sfg-setup manually, and pulling a published sfg-infra image is deferred.
 - The same compose definition can run a single-host pilot environment with production overrides, or be translated to the chosen cloud platform later (details deferred, see section 10).
 
 ### 3.6 sfg-infra (database schema)
@@ -222,8 +237,9 @@ How it fits with the other repos:
 - **Owns the PostgreSQL schema.** Versioned Flyway migrations in `src/main/resources/db/migration` (starting with `V1.0.0__initial_schema.sql`) and synthetic seed data in `db/seed/dev`, which is never applied outside dev and test.
 - **Local database:** its `docker-compose.yml` starts PostgreSQL 16 for development (`sfg_db`, user `sfg`).
 - **Applying migrations:** a small Quarkus application with Flyway applies them. The same image runs as a one-shot job before the backend starts in compose and in the pilot. **[Decision]** Migrations run under a dedicated schema-owner role; the backend connects with a lower-privilege application role that cannot change the schema. This is also where row-level security policies (6.2) will live.
-- **Relationship to sfg-common:** sfg-infra owns the DDL, sfg-common owns the entities that map it (3.4). Both must agree; validation tests catch drift.
-- **How the backend uses it:** sfg-backend tests check out sfg-infra next to it (`../sfg-infra`, overridable with `-Dsfg-infra.dir`), and Quarkus Dev Services starts a throwaway PostgreSQL that the migrations and dev seed are applied to. This keeps entities and schema in step without the backend owning DDL.
+- **Relationship to sfg-common:** sfg-infra owns the DDL, sfg-common owns the entities that map it (3.4). Both must agree (see the drift check in 3.4).
+- **How it is run today:** Shawn runs sfg-infra (database plus migrations) through sfg-setup.
+- **How the backend tests use it:** Quarkus Dev Services starts a throwaway PostgreSQL. When sfg-infra is checked out next to the backend (`../sfg-infra`, overridable with `-Dsfg-infra.dir`), the tests apply the real Flyway migrations. When it isn't, as in CI, the `no-sfg-infra` Maven profile lets Hibernate generate the schema instead. Tests create their own data rather than relying on the dev seed. Backend CI therefore needs no access to sfg-infra.
 - **Rules for schema changes:** migrations are forward-only and never edited after merge; a backend change that needs a new column merges the sfg-infra migration first; destructive changes go through expand-then-contract across two releases.
 
 ---
@@ -358,7 +374,7 @@ Mapped to brief section 4. A formal threat model (STRIDE per data flow above) is
 
 ### 6.6 Secure development lifecycle
 - Protected `main` branches, pull-request review, signed commits encouraged.
-- CI (GitHub Actions) on every PR: build and tests (sfg-backend checks out sfg-infra so tests run against the real migrations), SAST (e.g. CodeQL/Semgrep), dependency scanning (Dependabot/Renovate, OWASP Dependency-Check, `npm audit`), secret scanning, container image scanning (Trivy), SBOM generation.
+- CI (GitHub Actions) on every PR: build and tests, SAST (e.g. CodeQL/Semgrep), dependency scanning (Dependabot/Renovate, OWASP Dependency-Check, `npm audit`), secret scanning, container image scanning (Trivy), SBOM generation.
 - Defined vulnerability handling: triage SLA by severity, remediation and retest.
 - Only synthetic or anonymised data in development and test environments.
 
@@ -560,7 +576,8 @@ flowchart TB
 
 - **Environments:** local (compose, synthetic data), test/staging (synthetic data only), pilot (real data, only after go/no-go).
 - **CI pattern (per repo, GitHub Actions):**
-  - `build.yml` on every pull request: build and run the tests. sfg-backend also checks out the private sfg-infra repo (needs a `SFG_INFRA_TOKEN` secret, a fine-grained read-only token) so tests run against the real migrations.
+  - `build.yml` on every pull request: build and run the tests. sfg-backend's tests use a Hibernate-generated schema in CI (3.6), so CI needs no access to sfg-infra; it reads sfg-common from GitHub Packages with `GITHUB_TOKEN`.
+  - sfg-common: `publish-common.yml` deploys the jar to GitHub Packages on push to `main`.
   - `build-<component>.yml` on push to `main`: compile with Maven (or the JS build), build a small runtime image from a `Dockerfile.runtime` (for the backend, `eclipse-temurin:21-jre-alpine` with the pre-built `target/quarkus-app`), and push it to **Docker Hub** as `<DOCKERHUB_USERNAME>/sfg-<component>:latest` and `:<git sha>`. Needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets.
   - Images: `sfg-backend`, `sfg-infra`, `sfg-frontend`. Mobile builds go to the app stores instead.
 - **Image hygiene [Decision]:** Docker Hub repositories should be **private**, since they hold the application (**[Open] Q15**). Images get a vulnerability scan (e.g. Trivy) before push. sfg-setup pins the `:<sha>` tag for anything beyond local dev; `:latest` is for local convenience only.
@@ -572,13 +589,13 @@ flowchart TB
 
 ## 11. Proposed delivery staging
 
-Aligned with the brief's six-month plan.
+Aligned with the brief's six-month plan. Because AI is the main driver, the assistant is treated as a workstream that runs through all three stages, not a late feature.
 
 | Stage | Focus | Architecture outputs |
 |---|---|---|
-| **1. Planning and design** (about month 1) | Requirements, architecture, threat model, acceptance criteria | This HLD finalised, ADRs, threat model, POPIA control register, calc specification and golden test vectors, API contract v1, LLM model shortlist and GPU hosting choice |
-| **2. Development and integration** (about months 2 to 5) | Secure foundations first, then features | Auth + workspaces + audit + upload pipeline → extraction and review → calc and X-ray → goals and notifications → Ask SFG assistant with local LLM and guardrails → reports → SME pilot features |
-| **3. Validation and pilot readiness** (about month 6) | Testing and go/no-go | Assistant evaluation gate, pen test and retest, restore test, user testing, documentation, handover, go/no-go |
+| **1. Planning and design** (about month 1) | Requirements, architecture, threat model, acceptance criteria, **AI proof of concept** | This HLD finalised, ADRs, threat model, POPIA control register, calc specification and golden test vectors, API contract v1. **Ask SFG spike:** local model running, three or four tools over synthetic SME data, first evaluation questions, model shortlist and GPU hosting choice |
+| **2. Development and integration** (about months 2 to 5) | Secure foundations first, then features, with **Ask SFG growing alongside every feature** | Auth + workspaces + audit + upload pipeline → extraction and review → calc and X-ray → goals and notifications → reports → SME pilot features. The assistant module, guardrails and conversation UI land early; each financial feature ships with its assistant tool and evaluation questions, so the assistant is usable from the first confirmed dataset rather than bolted on at the end |
+| **3. Validation and pilot readiness** (about month 6) | Testing and go/no-go | Assistant evaluation gate (figure accuracy, tool choice, refusals, helpfulness rated by pilot reviewers) and AI red-team test, pen test and retest, restore test, user testing, documentation, handover, go/no-go |
 
 **Recommended deferrals** to keep release 1 secure and achievable: bank integrations, OCR of scanned documents (unless pilot data shows it is essential), formats beyond PDF/CSV, multi-user business accounts, assistant write actions (it stays read-only), voice input, offline mobile mode, and native-image builds.
 
