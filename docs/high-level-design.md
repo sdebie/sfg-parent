@@ -35,6 +35,7 @@ From the brief (section 3):
 **Personal financial health**
 - Onboarding and profile setup.
 - Secure upload of payslips, about three months of bank statements, and optional debt documents.
+- **Automatic import and categorisation of bank statements** (CSV first, then PDF), with low-confidence categories flagged for the customer (section 5.4).
 - Extraction of data from those documents, shown to the customer for review and correction.
 - A confirmation step where the customer resolves ambiguous transaction categories or extracted values.
 - A **Financial X-ray**: cash flow, debt, savings, progress towards goals.
@@ -165,6 +166,7 @@ A single Quarkus application, deployed in two roles from the same image: **api**
 | `workspace` | Personal and business workspaces, membership, and the tenant context applied to every request |
 | `documents` | Upload intake, validation, quarantine, malware scan, encrypted storage, retention and deletion |
 | `extraction` | Parsers for PDF and CSV (payslips, bank statements, invoices, debt documents); produces *proposed* data with confidence scores and source references (page/line) |
+| `categorisation` | Turns imported transactions into categories: workspace rules, system rules, shared merchant map, then the local LLM, with confidence and source recorded (5.4) |
 | `review` | Customer review and correction of extracted data; ambiguous-category resolution; confirmation and locking of a dataset |
 | `ledger` | Confirmed transactions, categories, income, debts and balances per workspace |
 | `calc` | **Deterministic calculation engine**: cash flow, debt ratios, savings rate, goal projections, SME cash-flow. Pure functions, `BigDecimal`, versioned, no I/O |
@@ -308,7 +310,7 @@ sequenceDiagram
   API->>DB: Create locked dataset version, audit
 ```
 
-Extraction strategy **[Decision]**:
+Extraction strategy **[Decision]** (bank statements are covered in detail in 5.4):
 1. **CSV:** deterministic column mapping per known bank format, with a manual mapping fallback.
 2. **Text-based PDF:** text extraction (Apache PDFBox/Tika) plus bank- and payslip-specific templates for the main South African banks and common payroll formats.
 3. **Scanned or unknown PDFs:** marked "needs manual entry" in release 1, or OCR if confirmed (Q4). AI-based extraction, if used at all, is only an assistant that pre-fills proposals, under the same safeguards as section 7, and never skips the customer review.
@@ -336,6 +338,70 @@ flowchart LR
 - A scheduled job runs weekly per workspace, recomputes goal progress from the latest confirmed dataset, and sends a progress notification (push and/or email per user preference).
 - A 30-day review is scheduled at goal creation and prompts the customer to upload newer statements and revisit the plan.
 - Because there is no bank feed, progress reflects the data the customer has uploaded; the UI says so (brief 3.3).
+
+### 5.4 Bank statement import and automatic categorisation
+
+Importing bank statements and grouping transactions into categories automatically is a core feature:
+every X-ray figure, goal projection and Ask SFG answer about spending depends on it. The design has two
+parts: **import** turns any supported statement into one clean, verified list of transactions, and
+**categorisation** assigns each transaction a category, cheapest and most predictable method first.
+
+```mermaid
+flowchart LR
+  F["Uploaded statement<br/>(CSV, OFX, PDF)"] --> DET["Detect bank + format"]
+  DET --> P["Per-bank parser<br/>(versioned)"]
+  P --> N["Normalise<br/>one transaction shape"]
+  N --> V{"Balances reconcile?<br/>Period covered?"}
+  V -- no --> FLAG["Flag statement<br/>for review"]
+  V -- yes --> D["De-duplicate<br/>+ detect own transfers"]
+  D --> C1["1. Workspace rules<br/>(from corrections)"]
+  C1 -->|unmatched| C2["2. System rules<br/>(fees, interest, cash, salary)"]
+  C2 -->|unmatched| C3["3. Shared merchant map<br/>+ similar-merchant lookup"]
+  C3 -->|unmatched| C4["4. Local LLM (Ollama)<br/>fixed category list + confidence"]
+  C4 --> R{"Confidence high?"}
+  R -- yes --> OK["Proposed category"]
+  R -- no --> REV["Needs review"]
+  OK --> CONF["Customer review + confirm<br/>(corrections become rules)"]
+  REV --> CONF
+  CONF --> LEDGER["Confirmed dataset<br/>→ calc, X-ray, Ask SFG"]
+```
+
+#### Import
+
+1. **Formats, in order of priority:**
+   - **CSV:** every major South African bank lets customers download CSV. Simplest and most reliable, so it comes first.
+   - **OFX/QFX** where a bank offers it (structured, easy to parse); confirm in Q4.
+   - **Text-based PDF:** text extraction (Apache PDFBox) plus a template per bank and statement layout.
+   - **Scanned PDFs or photos:** OCR (for example Tesseract) only if Q4 confirms it is needed; otherwise the customer is asked for a CSV or digital PDF.
+2. **Bank and format detection:** each parser recognises its own files (CSV header row, PDF text markers such as the bank name and layout). Unknown files are not guessed at; the customer is asked to pick the bank or upload another format.
+3. **One parser per bank and format, versioned.** Parsers live in the `extraction` module behind one interface, each with synthetic or redacted sample files as tests. Start with the banks most used by pilot participants (Q22); the usual candidates are Absa, Capitec, FNB, Nedbank, Standard Bank, TymeBank and Discovery Bank.
+4. **Normalise to one transaction shape:** transaction date, value date, raw description, cleaned description, extracted merchant, transaction type (card purchase, debit order, EFT, cash withdrawal, fee, interest, salary), signed amount (`BigDecimal`, ZAR), running balance, masked account, and the source document, page and line, plus parser version.
+5. **Verify before accepting:** the opening balance plus all transactions must equal the closing balance, and each row's running balance must follow from the previous one. The statement must cover the period it claims, without gaps. A statement that fails is flagged for review with the reason, never silently accepted.
+6. **De-duplicate:** each transaction gets a fingerprint (account, date, amount, cleaned description, occurrence number that day), so overlapping statements and re-imports do not double count.
+7. **Detect transfers between own accounts:** matching amounts with opposite signs within a few days, across accounts in the same workspace, are marked as transfers, not income or spending. Money moving between a person's personal and business workspaces is flagged as a transfer (for example owner drawings) in each workspace, without linking the data.
+8. **Clean descriptions:** strip card numbers, POS prefixes, dates, reference numbers and location codes, so "POS PURCHASE 1234 WOOLWORTHS SANDTON 12/03" becomes merchant "Woolworths", type "card purchase".
+
+#### Categorisation (cheapest first)
+
+Each transaction goes through the steps below and stops at the first one that gives a confident answer.
+
+1. **Workspace rules.** Rules the customer created by correcting a category ("always put *Joe's Plumbing* under *Repairs*"). Highest priority, because they reflect the customer's own view.
+2. **System rules.** Deterministic rules on transaction type and known patterns: bank fees, interest, ATM cash withdrawals, debit orders to known insurers, salary credits matched to the uploaded payslip's employer.
+3. **Shared merchant map.** A curated dictionary of cleaned merchant names to categories (for example Engen, Shell to *Fuel*; Checkers, Pick n Pay to *Groceries*), plus a similar-merchant lookup (pgvector embeddings from a local embedding model) for spelling variants. It contains businesses only, never private individuals' names. New entries come from corrections only after they are seen across several workspaces and reviewed by the team, so no customer-specific data enters the shared map.
+4. **Local LLM (Ollama, the same server as Ask SFG).** Remaining transactions are sent in batches with only the cleaned description, transaction type, amount sign and workspace type. The model must answer with a category from the fixed list (structured JSON output, checked against the enum) and a confidence. It has no tools and cannot invent categories, so hostile text in a statement can at worst produce a wrong suggestion, which the customer review catches.
+5. **Needs review.** Anything below the confidence threshold, or where steps disagree, is shown in the confirmation step (brief 3.1) for the customer to resolve.
+
+**Learning from corrections:** when a customer changes a category, the app offers "apply to similar transactions?" and saves a workspace rule. Rules are visible and editable in settings.
+
+**Category lists:** two lists, each with groups and categories, held as enums in sfg-common and signed off by Finance Blueprint (Q21).
+- *Personal*, for example: income (salary, other income), housing, groceries, transport and fuel, utilities, insurance, debt repayments, eating out, entertainment, subscriptions, health, education, savings and investments, transfers, fees.
+- *Business*, for example: sales income, cost of sales and stock, salaries and wages, rent, utilities, vehicle and fuel, marketing, software and subscriptions, professional fees, bank charges, tax (VAT, PAYE, SARS), loan repayments, owner drawings, transfers.
+
+**Auditability:** every transaction stores where its category came from (rule id, system rule, merchant map, model and version, or customer) and the confidence. The X-ray and Ask SFG can explain "why is this under Groceries?". The calculation engine only uses categories from a **confirmed** dataset, so the model suggests but never decides a number.
+
+**Measuring it:** track, per bank and per step, the share of transactions categorised automatically, the accuracy of automatic categories (measured on a labelled synthetic or consented set, and on customer corrections), and the review rate. Proposed POC targets, to be set from real data: at least 80% categorised automatically, with at least 95% of those correct.
+
+**Performance:** three months of statements is typically a few hundred to about 1,500 transactions. Rules and the merchant map handle most of them, so the LLM sees only the remainder, in batches, in the background worker. The customer sees progress and can start reviewing straight away.
 
 ---
 
@@ -605,8 +671,8 @@ Aligned with the brief's six-month plan. Because AI is the main driver, the assi
 
 | Stage | Focus | Architecture outputs |
 |---|---|---|
-| **1. Planning and design** (about month 1) | Requirements, architecture, threat model, acceptance criteria, **AI proof of concept** | This HLD finalised, ADRs, threat model, POPIA control register, calc specification and golden test vectors, API contract v1. **Ask SFG spike:** local model running, three or four tools over synthetic SME data, first evaluation questions, model shortlist and GPU hosting choice |
-| **2. Development and integration** (about months 2 to 5) | Secure foundations first, then features, with **Ask SFG growing alongside every feature** | Auth + workspaces + audit + upload pipeline → extraction and review → calc and X-ray → goals and notifications → reports → SME pilot features. The assistant module, guardrails and conversation UI land early; each financial feature ships with its assistant tool and evaluation questions, so the assistant is usable from the first confirmed dataset rather than bolted on at the end |
+| **1. Planning and design** (about month 1) | Requirements, architecture, threat model, acceptance criteria, **AI proof of concept** | This HLD finalised, ADRs, threat model, POPIA control register, calc specification and golden test vectors, API contract v1. **Bank import spike:** CSV parsers for two or three pilot banks, the categorisation cascade on synthetic statements, first accuracy figures. **Ask SFG spike:** local model running, three or four tools over synthetic SME data, first evaluation questions, model shortlist and GPU hosting choice |
+| **2. Development and integration** (about months 2 to 5) | Secure foundations first, then features, with **Ask SFG growing alongside every feature** | Auth + workspaces + audit + upload pipeline → bank statement import and categorisation (more banks, PDF templates) → other extraction and review → calc and X-ray → goals and notifications → reports → SME pilot features. The assistant module, guardrails and conversation UI land early; each financial feature ships with its assistant tool and evaluation questions, so the assistant is usable from the first confirmed dataset rather than bolted on at the end |
 | **3. Validation and pilot readiness** (about month 6) | Testing and go/no-go | Assistant evaluation gate (figure accuracy, tool choice, refusals, helpfulness rated by pilot reviewers) and AI red-team test, pen test and retest, restore test, user testing, documentation, handover, go/no-go |
 
 **Recommended deferrals** to keep release 1 secure and achievable: bank integrations, OCR of scanned documents (unless pilot data shows it is essential), formats beyond PDF/CSV, multi-user business accounts, assistant write actions (it stays read-only), voice input, offline mobile mode, and native-image builds.
@@ -651,3 +717,5 @@ Aligned with the brief's six-month plan. Because AI is the main driver, the assi
 | Q18 | Where will the GPU for the local model run in the pilot: a GPU VM in a South African cloud region (if available), a dedicated GPU server in a South African data centre, or on-premises? | Dev team + Finance Blueprint |
 | Q19 | Which questions must Ask SFG handle well at launch? A list of 30 to 50 real questions from pilot businesses would seed the evaluation set. | Product / Finance Blueprint |
 | Q20 | Who writes and reviews the guidance content the assistant can quote (budgeting, saving, SME cash-flow practice)? | Finance Blueprint |
+| Q21 | Who signs off the personal and business category lists, and do they need to line up with any accounting or tax categories (for example for VAT)? | Finance Blueprint |
+| Q22 | Which banks do the pilot participants use? Can we get synthetic or redacted sample statements (CSV and PDF) for each, to build and test the parsers? | Finance Blueprint |
