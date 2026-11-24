@@ -35,6 +35,7 @@ From the brief (section 3):
 **Personal financial health**
 - Onboarding and profile setup.
 - Secure upload of payslips, about three months of bank statements, and optional debt documents.
+- **Automatic import and categorisation of bank statements** (CSV first, then PDF), with low-confidence categories flagged for the customer (section 5.4).
 - Extraction of data from those documents, shown to the customer for review and correction.
 - A confirmation step where the customer resolves ambiguous transaction categories or extracted values.
 - A **Financial X-ray**: cash flow, debt, savings, progress towards goals.
@@ -92,15 +93,15 @@ flowchart LR
   end
 
   subgraph Platform
-    MIG["DB migrations<br/>(sfg-infra: Flyway)"]
     IDP["Identity provider<br/>(Keycloak, OIDC)"]
-    API["SFG API<br/>(sfg-backend: Quarkus)"]
+    MIG["DB migrations, one-shot<br/>(sfg-infra: Flyway as sfg_owner)"]
+    API["SFG API<br/>(sfg-backend: Quarkus, DB role sfg_app)"]
     WRK["Document workers<br/>(same codebase, worker profile)"]
     AV["Malware scanner<br/>(ClamAV)"]
     DB[("PostgreSQL<br/>app data + audit log")]
     OBJ[("Object storage<br/>encrypted documents")]
     KMS["Key management<br/>(cloud KMS / Vault)"]
-    LLM["Local LLM server<br/>(vLLM on GPU, no internet egress)"]
+    LLM["Local LLM server<br/>(Ollama for POC, vLLM later; no internet egress)"]
   end
 
   subgraph External["Third parties (contracted, minimal data)"]
@@ -131,13 +132,13 @@ flowchart LR
 |---|---|---|
 | Backend | Quarkus (Java 21 LTS) | Stated in project setup; strong OIDC, security and native-image support |
 | API style | REST (`/api/v1`, OpenAPI) **and** GraphQL (`/api/graphql`, SmallRye GraphQL) over one shared service layer | REST for simple, cacheable and file-upload calls; GraphQL lets the X-ray and dashboard screens fetch exactly what they need in one round trip |
-| Schema migrations | Flyway, owned by the separate **sfg-infra** repo | Schema changes are reviewed and versioned on their own; Hibernate never generates DDL |
+| Schema migrations | Flyway, owned and run by the separate **sfg-infra** repo as a one-shot job before the backend starts | Schema changes are reviewed and versioned on their own; the backend can't change the schema, and Hibernate never generates DDL |
 | Database | PostgreSQL 16 | Relational integrity for financial data; row-level security for tenant separation |
 | Document storage | S3-compatible object storage (MinIO locally, cloud bucket in pilot) | Keeps large binaries out of the DB; per-object encryption and lifecycle rules |
 | Identity | Keycloak (self-hosted) **[Decision]** | Open source, OIDC/PKCE, MFA, runs in docker-compose; avoids per-user SaaS fees and keeps identity data in-region |
 | Async jobs | PostgreSQL-backed job queue (e.g. Quartz/JobRunr or `SKIP LOCKED` table) **[Decision]** | Pilot volumes are tiny; avoids running Kafka/RabbitMQ |
 | Malware scanning | ClamAV sidecar | Uploaded files are untrusted input |
-| AI | Local open-weight LLM served by vLLM (Ollama for dev), called via Quarkus LangChain4j with read-only tools **[Decision]** | Customers can ask questions about their data without any financial data going to a cloud AI (section 7) |
+| AI | Local open-weight LLM, served by **Ollama for the POC** (decided) and swappable to vLLM by configuration, called via Quarkus LangChain4j with read-only tools | Customers can ask questions about their data without any financial data going to a cloud AI (section 7) |
 | Hosting | Containers in a South African cloud region (e.g. AWS af-south-1 or Azure South Africa North) **[Open] Q1** | Keeps personal information in-country, simplifies POPIA section 72 |
 
 ---
@@ -149,7 +150,7 @@ All repositories live at `github.com/sdebie`.
 | Repo | Purpose | Main contents |
 |---|---|---|
 | **sfg-parent** | Project documentation and cross-repo decisions | This HLD, architecture decision records (`docs/adr/`), threat model, security and POPIA control register, roadmap |
-| **sfg-infra** | Database schema and local database | Flyway migrations (`db/migration`), dev seed data (`db/seed/dev`), a `docker-compose.yml` for a local PostgreSQL, and a small Quarkus app that applies the migrations |
+| **sfg-infra** | Database schema and local database | Flyway migrations (`db/migration`), dev seed data (`db/seed/dev`), a `docker-compose.yml` for a local PostgreSQL. Owns the schema and the database roles, and runs the migrations as a one-shot job before the backend starts |
 | **sfg-setup** | Run the whole system locally and for the pilot | `docker-compose.yml`, env templates, startup and seed scripts. Compose **pulls** published images (details deferred) |
 | **sfg-common** | Shared Java library and owner of the data model | Enums, JPA entities, DTOs and Panache repositories, published as a Maven artifact |
 | **sfg-backend** | The SFG API and document workers | Quarkus application (REST + GraphQL), services, calculation engine. Uses the entities, DTOs and repositories from sfg-common; no DDL |
@@ -167,6 +168,7 @@ A single Quarkus application, deployed in two roles from the same image: **api**
 | `workspace` | Personal and business workspaces, membership, and the tenant context applied to every request |
 | `documents` | Upload intake, validation, quarantine, malware scan, encrypted storage, retention and deletion |
 | `extraction` | Parsers for PDF and CSV (payslips, bank statements, invoices, debt documents); produces *proposed* data with confidence scores and source references (page/line) |
+| `categorisation` | Turns imported transactions into categories: workspace rules, system rules, shared merchant map, then the local LLM, with confidence and source recorded (5.4) |
 | `review` | Customer review and correction of extracted data; ambiguous-category resolution; confirmation and locking of a dataset |
 | `ledger` | Confirmed transactions, categories, income, debts and balances per workspace |
 | `calc` | **Deterministic calculation engine**: cash flow, debt ratios, savings rate, goal projections, SME cash-flow. Pure functions, `BigDecimal`, versioned, no I/O |
@@ -181,7 +183,7 @@ A single Quarkus application, deployed in two roles from the same image: **api**
 
 Notes:
 - **Calculation engine discipline.** `calc` has no dependency on frameworks or AI. Each run records the engine version and a hash of its inputs, so any figure in a report can be reproduced. Golden test vectors (agreed with Finance Blueprint) gate every change.
-- **Persistence.** Hibernate ORM with Panache, with `quarkus.hibernate-orm.database.generation=none`. Entities, enums and repositories come from sfg-common (3.4); the DDL comes only from sfg-infra (3.6). All workspace-owned tables carry `workspace_id`.
+- **Persistence.** Hibernate ORM with Panache, with `quarkus.hibernate-orm.database.generation=none`. Entities, enums and repositories come from sfg-common (3.4); the DDL comes only from sfg-infra (3.6), which applies it before the backend starts. The backend connects as `sfg_app`, which can read and write data but not change the schema. All workspace-owned tables carry `workspace_id`.
 - **APIs.** Two front doors onto the same services:
   - **REST/JSON** under `/api/v1` (JAX-RS), with OpenAPI generated by SmallRye OpenAPI at `/q/openapi` and published to sfg-common. Used for uploads, downloads (reports), commands and anything that benefits from plain HTTP semantics.
   - **GraphQL** at `/api/graphql` (SmallRye GraphQL). Used for read-heavy screens such as the Financial X-ray, goals and dashboards. Mutations are allowed where they mirror a REST command.
@@ -221,25 +223,30 @@ on the Java side.
 
 How it fits with the other repos:
 - **Build and publish:** a Maven jar (`org.sfg.common:sfg-common`) with a Jandex index so Quarkus apps discover its entities and repository beans. `build.yml` builds it on PRs; `publish-common.yml` deploys it to GitHub Packages on push to `main`.
-- **sfg-backend** depends on it as a Maven dependency (or a local `mvn install` during development) and keeps only services, mappers and API resources. Backend CI reads the package from GitHub Packages with the workflow's own `GITHUB_TOKEN` (`packages: read`), so no extra secret is needed. sfg-common must be published before a backend change that needs it can pass CI.
-- **sfg-infra** holds the Flyway migrations (DDL). sfg-common entities and sfg-infra migrations must change together: a change that adds a column lands as an sfg-infra migration plus the matching sfg-common entity change, released in that order. Because backend CI no longer runs against the migrations (3.6), drift between entities and migrations is only caught when tests run locally with sfg-infra checked out. **[Decision]** Add a drift check before the pilot: for example, sfg-infra's CI applies its migrations and runs Hibernate schema *validation* with the published sfg-common jar.
+- **sfg-backend** depends on it as a Maven dependency (or a local `mvn install` during development) and keeps only services, mappers and API resources. Backend CI reads the package from GitHub Packages (see 10 for the token it needs). sfg-common must be published before a backend change that needs it can pass CI.
+- **sfg-infra** holds the Flyway migrations (DDL). sfg-common entities and sfg-infra migrations must change together: a change that adds a column lands as an sfg-infra migration plus the matching sfg-common entity change, released in that order. **[Decision]** Keep a drift check: backend tests apply the published sfg-infra migrations to a throwaway database (test scope only) and run Hibernate in `validate` mode, so a missing or renamed column fails the build.
 - **Web and mobile** cannot use a Java library. Their TypeScript types come from the backend's OpenAPI document and GraphQL schema instead; where that generated client lives is **[Open] Q17**.
 
 ### 3.5 sfg-setup
 
-- `docker-compose.yml` that pulls published images from Docker Hub for: `backend-api`, `backend-worker`, `frontend`, `infra` (runs the Flyway migrations, then exits), `postgres`, `keycloak`, `minio`, `clamav`, and for local use only `mailpit` (fake email). The backend starts only after the migration container has finished successfully.
+- `docker-compose.yml` that pulls published images from Docker Hub for: `backend-api`, `backend-worker`, `frontend`, `postgres`, `keycloak`, `minio`, `clamav`, and for local use only `mailpit` (fake email)., plus an `infra` service that runs the Flyway migrations and exits. The backend starts only after `infra` has finished successfully (3.6).
 - `.env.example` with every setting documented; no real secrets committed.
-- Startup scripts: create buckets, import the Keycloak realm, load synthetic seed data. Migrations are run by sfg-infra, not by the backend; today Shawn starts sfg-infra through sfg-setup manually, and pulling a published sfg-infra image is deferred.
+- Startup scripts: create buckets, import the Keycloak realm, load synthetic seed data. Migrations are run by the sfg-infra job, which can also load the dev seed locally.
 - The same compose definition can run a single-host pilot environment with production overrides, or be translated to the chosen cloud platform later (details deferred, see section 10).
 
 ### 3.6 sfg-infra (database schema)
 
 - **Owns the PostgreSQL schema.** Versioned Flyway migrations in `src/main/resources/db/migration` (starting with `V1.0.0__initial_schema.sql`) and synthetic seed data in `db/seed/dev`, which is never applied outside dev and test.
 - **Local database:** its `docker-compose.yml` starts PostgreSQL 16 for development (`sfg_db`, user `sfg`).
-- **Applying migrations:** a small Quarkus application with Flyway applies them. The same image runs as a one-shot job before the backend starts in compose and in the pilot. **[Decision]** Migrations run under a dedicated schema-owner role; the backend connects with a lower-privilege application role that cannot change the schema. This is also where row-level security policies (6.2) will live.
-- **Relationship to sfg-common:** sfg-infra owns the DDL, sfg-common owns the entities that map it (3.4). Both must agree (see the drift check in 3.4).
-- **How it is run today:** Shawn runs sfg-infra (database plus migrations) through sfg-setup.
-- **How the backend tests use it:** Quarkus Dev Services starts a throwaway PostgreSQL. When sfg-infra is checked out next to the backend (`../sfg-infra`, overridable with `-Dsfg-infra.dir`), the tests apply the real Flyway migrations. When it isn't, as in CI, the `no-sfg-infra` Maven profile lets Hibernate generate the schema instead. Tests create their own data rather than relying on the dev seed. Backend CI therefore needs no access to sfg-infra.
+- **Packaging:** sfg-infra publishes its migrations to GitHub Packages as a Maven artifact (`org.sfg.infra:sfg-infra:<version>:migrations`).
+- **Applying migrations (decided):** sfg-infra is the owner of the schema. Its Flyway runner applies the migrations as a **one-shot job before the backend starts**, in compose and in the pilot, then exits. The backend does not run migrations. Row-level security policies (6.2) also arrive as sfg-infra migrations.
+- **Database roles (decided):**
+  - `sfg_owner` owns the schema and tables and is used only by the migration job.
+  - `sfg_app` is the role the backend connects as. It has data access only (`SELECT`, `INSERT`, `UPDATE`, `DELETE` on the application tables, granted by the migrations) and cannot create or alter tables.
+  - Because `sfg_app` does not own the tables, row-level security applies to it without needing `FORCE ROW LEVEL SECURITY`.
+- **Who owns what:** sfg-infra owns the database (schema, roles, grants, RLS policies); sfg-common owns the Java side (entities and the repositories that access the database).
+- **Relationship to sfg-common:** sfg-infra owns the DDL, sfg-common owns the entities that map it (3.4). Backend tests catch any drift.
+- **How the backend tests get a schema:** see the drift check in 3.4. If the tests read a migrations artifact from GitHub Packages, backend CI needs a `PACKAGES_READ_TOKEN` secret (a classic PAT with `read:packages`) while sfg-infra is private.
 - **Rules for schema changes:** migrations are forward-only and never edited after merge; a backend change that needs a new column merges the sfg-infra migration first; destructive changes go through expand-then-contract across two releases.
 
 ---
@@ -308,7 +315,7 @@ sequenceDiagram
   API->>DB: Create locked dataset version, audit
 ```
 
-Extraction strategy **[Decision]**:
+Extraction strategy **[Decision]** (bank statements are covered in detail in 5.4):
 1. **CSV:** deterministic column mapping per known bank format, with a manual mapping fallback.
 2. **Text-based PDF:** text extraction (Apache PDFBox/Tika) plus bank- and payslip-specific templates for the main South African banks and common payroll formats.
 3. **Scanned or unknown PDFs:** marked "needs manual entry" in release 1, or OCR if confirmed (Q4). AI-based extraction, if used at all, is only an assistant that pre-fills proposals, under the same safeguards as section 7, and never skips the customer review.
@@ -337,6 +344,70 @@ flowchart LR
 - A 30-day review is scheduled at goal creation and prompts the customer to upload newer statements and revisit the plan.
 - Because there is no bank feed, progress reflects the data the customer has uploaded; the UI says so (brief 3.3).
 
+### 5.4 Bank statement import and automatic categorisation
+
+Importing bank statements and grouping transactions into categories automatically is a core feature:
+every X-ray figure, goal projection and Ask SFG answer about spending depends on it. The design has two
+parts: **import** turns any supported statement into one clean, verified list of transactions, and
+**categorisation** assigns each transaction a category, cheapest and most predictable method first.
+
+```mermaid
+flowchart LR
+  F["Uploaded statement<br/>(CSV, OFX, PDF)"] --> DET["Detect bank + format"]
+  DET --> P["Per-bank parser<br/>(versioned)"]
+  P --> N["Normalise<br/>one transaction shape"]
+  N --> V{"Balances reconcile?<br/>Period covered?"}
+  V -- no --> FLAG["Flag statement<br/>for review"]
+  V -- yes --> D["De-duplicate<br/>+ detect own transfers"]
+  D --> C1["1. Workspace rules<br/>(from corrections)"]
+  C1 -->|unmatched| C2["2. System rules<br/>(fees, interest, cash, salary)"]
+  C2 -->|unmatched| C3["3. Shared merchant map<br/>+ similar-merchant lookup"]
+  C3 -->|unmatched| C4["4. Local LLM (Ollama)<br/>fixed category list + confidence"]
+  C4 --> R{"Confidence high?"}
+  R -- yes --> OK["Proposed category"]
+  R -- no --> REV["Needs review"]
+  OK --> CONF["Customer review + confirm<br/>(corrections become rules)"]
+  REV --> CONF
+  CONF --> LEDGER["Confirmed dataset<br/>→ calc, X-ray, Ask SFG"]
+```
+
+#### Import
+
+1. **Formats, in order of priority:**
+   - **CSV:** every major South African bank lets customers download CSV. Simplest and most reliable, so it comes first.
+   - **OFX/QFX** where a bank offers it (structured, easy to parse); confirm in Q4.
+   - **Text-based PDF:** text extraction (Apache PDFBox) plus a template per bank and statement layout.
+   - **Scanned PDFs or photos:** OCR (for example Tesseract) only if Q4 confirms it is needed; otherwise the customer is asked for a CSV or digital PDF.
+2. **Bank and format detection:** each parser recognises its own files (CSV header row, PDF text markers such as the bank name and layout). Unknown files are not guessed at; the customer is asked to pick the bank or upload another format.
+3. **One parser per bank and format, versioned.** Parsers live in the `extraction` module behind one interface, each with synthetic or redacted sample files as tests. Start with the banks most used by pilot participants (Q22); the usual candidates are Absa, Capitec, FNB, Nedbank, Standard Bank, TymeBank and Discovery Bank.
+4. **Normalise to one transaction shape:** transaction date, value date, raw description, cleaned description, extracted merchant, transaction type (card purchase, debit order, EFT, cash withdrawal, fee, interest, salary), signed amount (`BigDecimal`, ZAR), running balance, masked account, and the source document, page and line, plus parser version.
+5. **Verify before accepting:** the opening balance plus all transactions must equal the closing balance, and each row's running balance must follow from the previous one. The statement must cover the period it claims, without gaps. A statement that fails is flagged for review with the reason, never silently accepted.
+6. **De-duplicate:** each transaction gets a fingerprint (account, date, amount, cleaned description, occurrence number that day), so overlapping statements and re-imports do not double count.
+7. **Detect transfers between own accounts:** matching amounts with opposite signs within a few days, across accounts in the same workspace, are marked as transfers, not income or spending. Money moving between a person's personal and business workspaces is flagged as a transfer (for example owner drawings) in each workspace, without linking the data.
+8. **Clean descriptions:** strip card numbers, POS prefixes, dates, reference numbers and location codes, so "POS PURCHASE 1234 WOOLWORTHS SANDTON 12/03" becomes merchant "Woolworths", type "card purchase".
+
+#### Categorisation (cheapest first)
+
+Each transaction goes through the steps below and stops at the first one that gives a confident answer.
+
+1. **Workspace rules.** Rules the customer created by correcting a category ("always put *Joe's Plumbing* under *Repairs*"). Highest priority, because they reflect the customer's own view.
+2. **System rules.** Deterministic rules on transaction type and known patterns: bank fees, interest, ATM cash withdrawals, debit orders to known insurers, salary credits matched to the uploaded payslip's employer.
+3. **Shared merchant map.** A curated dictionary of cleaned merchant names to categories (for example Engen, Shell to *Fuel*; Checkers, Pick n Pay to *Groceries*), plus a similar-merchant lookup (pgvector embeddings from a local embedding model) for spelling variants. It contains businesses only, never private individuals' names. New entries come from corrections only after they are seen across several workspaces and reviewed by the team, so no customer-specific data enters the shared map.
+4. **Local LLM (Ollama, the same server as Ask SFG).** Remaining transactions are sent in batches with only the cleaned description, transaction type, amount sign and workspace type. The model must answer with a category from the fixed list (structured JSON output, checked against the enum) and a confidence. It has no tools and cannot invent categories, so hostile text in a statement can at worst produce a wrong suggestion, which the customer review catches.
+5. **Needs review.** Anything below the confidence threshold, or where steps disagree, is shown in the confirmation step (brief 3.1) for the customer to resolve.
+
+**Learning from corrections:** when a customer changes a category, the app offers "apply to similar transactions?" and saves a workspace rule. Rules are visible and editable in settings.
+
+**Category lists:** two lists, each with groups and categories, held as enums in sfg-common and signed off by Finance Blueprint (Q21).
+- *Personal*, for example: income (salary, other income), housing, groceries, transport and fuel, utilities, insurance, debt repayments, eating out, entertainment, subscriptions, health, education, savings and investments, transfers, fees.
+- *Business*, for example: sales income, cost of sales and stock, salaries and wages, rent, utilities, vehicle and fuel, marketing, software and subscriptions, professional fees, bank charges, tax (VAT, PAYE, SARS), loan repayments, owner drawings, transfers.
+
+**Auditability:** every transaction stores where its category came from (rule id, system rule, merchant map, model and version, or customer) and the confidence. The X-ray and Ask SFG can explain "why is this under Groceries?". The calculation engine only uses categories from a **confirmed** dataset, so the model suggests but never decides a number.
+
+**Measuring it:** track, per bank and per step, the share of transactions categorised automatically, the accuracy of automatic categories (measured on a labelled synthetic or consented set, and on customer corrections), and the review rate. Proposed POC targets, to be set from real data: at least 80% categorised automatically, with at least 95% of those correct.
+
+**Performance:** three months of statements is typically a few hundred to about 1,500 transactions. Rules and the merchant map handle most of them, so the LLM sees only the remainder, in batches, in the background worker. The customer sees progress and can start reviewing straight away.
+
 ---
 
 ## 6. Security architecture
@@ -351,7 +422,7 @@ Mapped to brief section 4. A formal threat model (STRIDE per data flow above) is
 
 ### 6.2 Authorization and personal/business separation
 - Every request runs in a **workspace context**; the backend checks the caller's membership and role on that workspace for every call (deny by default).
-- **Defence in depth:** PostgreSQL row-level security on all workspace-owned tables, with the workspace id set per transaction, so a missed check in code still cannot return another workspace's rows.
+- **Defence in depth:** PostgreSQL row-level security on all workspace-owned tables (the backend connects as `sfg_app`, which does not own the tables, so the policies always apply; see 3.6), with the workspace id set per transaction, so a missed check in code still cannot return another workspace's rows.
 - Object storage keys are prefixed by workspace and never guessable; documents are only served through the API after an authorization check (no public URLs).
 - Explicit UI separation between personal and business modes; no cross-workspace aggregation in release 1.
 - Operator/admin access is separate (own realm or role, MFA, IP-restricted), least privilege, and every access is audited.
@@ -409,8 +480,20 @@ It replaces the earlier "explanations only" scope for AI and the plan to defer A
 **Personal and business financial data never goes to a cloud AI service.** The language model runs on
 infrastructure SFG controls, in South Africa, on a private network with no internet access.
 
-- **Serving:** [vLLM](https://github.com/vllm-project/vllm) in the pilot and staging (efficient batching, OpenAI-compatible API, tool-calling support). [Ollama](https://ollama.com) on developer machines (for example a Mac with Apple Silicon) and in the local compose stack. Both expose the same OpenAI-compatible API, so switching is configuration only.
-- **Integration:** the backend uses the [Quarkus LangChain4j](https://docs.quarkiverse.io/quarkus-langchain4j/dev/) extension with its OpenAI-compatible client pointed at the local server. Tools are plain Java methods on backend services.
+- **Serving, POC (decided):** [Ollama](https://ollama.com), on a developer machine (for example a Mac with Apple Silicon) or a single GPU server. It is the quickest way to get a local model answering questions.
+- **Serving, later:** [vLLM](https://github.com/vllm-project/vllm) once the pilot needs better throughput and batching, or any other server with an OpenAI-compatible API. Whether and when to switch is decided from the POC results.
+- **Swappable by configuration [Decision]:** the backend uses the [Quarkus LangChain4j](https://docs.quarkiverse.io/quarkus-langchain4j/dev/) extension with its **OpenAI-compatible** client (`quarkus-langchain4j-openai`), not an Ollama-specific client. Ollama and vLLM both serve that API, so changing the serving engine or the model means changing only configuration, for example:
+
+  ```properties
+  # POC: Ollama
+  quarkus.langchain4j.openai.base-url=${LLM_BASE_URL:http://localhost:11434/v1}
+  quarkus.langchain4j.openai.chat-model.model-name=${LLM_MODEL:qwen3:14b}
+  # Later: vLLM, same keys
+  # LLM_BASE_URL=http://llm:8000/v1   LLM_MODEL=Qwen/Qwen3-32B
+  ```
+
+  Rules that keep it swappable: no code depends on Ollama-specific APIs or model-specific prompt formats; prompts, tools and guardrails live in the `assistant` module, not in the server; and the evaluation set (7.7) is rerun on every change of server or model, because tool-calling quality differs between models.
+- **Integration:** tools are plain Java methods on backend services, exposed to the model through LangChain4j's tool support.
 - **Model choice:** open-weight models with strong tool calling and a permissive commercial licence, chosen by running the evaluation set (7.7) on SFG's own synthetic data. Candidates to evaluate, as of late 2026:
 
 | Size class | Example candidates | Typical GPU memory (quantised) | Fit |
@@ -421,7 +504,7 @@ infrastructure SFG controls, in South Africa, on a private network with no inter
 
 Licences must allow commercial use (for example Apache 2.0 for Qwen3, gpt-oss and Mistral Small; Llama has its own community licence). Model weights are downloaded once from the official source, checksummed and stored in SFG's own registry; the serving container never pulls models at runtime.
 
-- **Capacity for the pilot:** 100 participants means a handful of concurrent questions at peak. One GPU running a medium model with vLLM is enough, with a target of first words in under 2 seconds and a full answer in under 15 seconds. Where the GPU is hosted is **[Open] Q18**: GPU instances in South African cloud regions are limited, so options are a GPU VM in-region if available, a dedicated GPU server in a South African data centre, or on-premises hardware.
+- **Capacity for the pilot:** 100 participants means a handful of concurrent questions at peak. One GPU running a medium model is enough (Ollama for the POC, vLLM if concurrency needs it), with a target of first words in under 2 seconds and a full answer in under 15 seconds. Where the GPU is hosted is **[Open] Q18**: GPU instances in South African cloud regions are limited, so options are a GPU VM in-region if available, a dedicated GPU server in a South African data centre, or on-premises hardware.
 
 ### 7.3 How a question is answered
 
@@ -431,7 +514,7 @@ sequenceDiagram
   actor C as Customer
   participant App as Web / Mobile
   participant AS as assistant module (backend)
-  participant LLM as Local LLM (vLLM)
+  participant LLM as Local LLM (Ollama / vLLM)
   participant T as Tools (read-only services)
   participant CALC as calc engine
   participant DB as PostgreSQL
@@ -476,7 +559,7 @@ Key rules:
 - **`assistant` module (sfg-backend):** conversation API, orchestration loop (LangChain4j AI service with tools), tool registry, guardrails, streaming responses (Server-Sent Events from a REST endpoint), per-user rate limits and token budgets.
 - **Conversation store:** conversations and messages per workspace in PostgreSQL (entities in sfg-common, tables in sfg-infra), encrypted at rest, subject to the retention schedule (Q3) and deleted with the workspace.
 - **Knowledge base:** reviewed guidance articles (budgeting, saving, debt, SME cash-flow practice) embedded with a local embedding model and stored with pgvector. No customer data in this index.
-- **LLM server:** vLLM container (Ollama locally) on a GPU node, reachable only from the backend.
+- **LLM server:** Ollama for the POC, swappable to vLLM by configuration (7.2), on a GPU node or developer machine, reachable only from the backend.
 - **Clients:** an "Ask SFG" screen in web and mobile with suggested questions, streamed answers and figure cards. Available in both personal and business workspaces, scoped to the one in use.
 
 ### 7.5 Safeguards
@@ -561,14 +644,14 @@ flowchart TB
   end
   subgraph Pilot["Pilot environment (South African region)"]
     LB["TLS load balancer / WAF"] --> FE["frontend (nginx)"]
-    MG["infra (Flyway, one-shot)"] --> PG
+    MG["sfg-infra migrations<br/>(one-shot, sfg_owner)"] --> PG
     LB --> BE["backend-api"]
     BE --> WK["backend-worker"]
     BE --> PG[("Managed PostgreSQL")]
     BE --> S3[("Object storage")]
     BE --> KC["Keycloak"]
     WK --> CL["ClamAV"]
-    BE --> AI["vLLM on GPU node<br/>(private, no egress)"]
+    BE --> AI["LLM server on GPU node<br/>(Ollama POC / vLLM; private, no egress)"]
   end
   IMG --> DC
   IMG --> Pilot
@@ -576,10 +659,11 @@ flowchart TB
 
 - **Environments:** local (compose, synthetic data), test/staging (synthetic data only), pilot (real data, only after go/no-go).
 - **CI pattern (per repo, GitHub Actions):**
-  - `build.yml` on every pull request: build and run the tests. sfg-backend's tests use a Hibernate-generated schema in CI (3.6), so CI needs no access to sfg-infra; it reads sfg-common from GitHub Packages with `GITHUB_TOKEN`.
+  - `build.yml` on every pull request: build and run the tests. sfg-backend reads sfg-common from GitHub Packages and validates the entities against the sfg-infra migrations (3.4, 3.6).
+  - sfg-infra: builds the migration runner image (and, if the backend tests use it, a migrations jar for GitHub Packages).
   - sfg-common: `publish-common.yml` deploys the jar to GitHub Packages on push to `main`.
   - `build-<component>.yml` on push to `main`: compile with Maven (or the JS build), build a small runtime image from a `Dockerfile.runtime` (for the backend, `eclipse-temurin:21-jre-alpine` with the pre-built `target/quarkus-app`), and push it to **Docker Hub** as `<DOCKERHUB_USERNAME>/sfg-<component>:latest` and `:<git sha>`. Needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets.
-  - Images: `sfg-backend`, `sfg-infra`, `sfg-frontend`. Mobile builds go to the app stores instead.
+  - Images: `sfg-backend`, `sfg-infra` (one-shot migration runner), `sfg-frontend`. Mobile builds go to the app stores instead.
 - **Image hygiene [Decision]:** Docker Hub repositories should be **private**, since they hold the application (**[Open] Q15**). Images get a vulnerability scan (e.g. Trivy) before push. sfg-setup pins the `:<sha>` tag for anything beyond local dev; `:latest` is for local convenience only.
 - **Pilot hosting:** container platform in a South African region with managed PostgreSQL, object storage and KMS, plus one GPU node for the LLM server; exact platform deferred (**[Open] Q1**, GPU hosting **Q18**). Locally, sfg-setup adds an `ollama` service (or uses Ollama installed on the host, which is faster on a Mac). A single-host compose deployment is acceptable for staging.
 - **Mobile distribution:** TestFlight (iOS) and Google Play internal/closed testing for pilot participants.
@@ -593,8 +677,8 @@ Aligned with the brief's six-month plan. Because AI is the main driver, the assi
 
 | Stage | Focus | Architecture outputs |
 |---|---|---|
-| **1. Planning and design** (about month 1) | Requirements, architecture, threat model, acceptance criteria, **AI proof of concept** | This HLD finalised, ADRs, threat model, POPIA control register, calc specification and golden test vectors, API contract v1. **Ask SFG spike:** local model running, three or four tools over synthetic SME data, first evaluation questions, model shortlist and GPU hosting choice |
-| **2. Development and integration** (about months 2 to 5) | Secure foundations first, then features, with **Ask SFG growing alongside every feature** | Auth + workspaces + audit + upload pipeline → extraction and review → calc and X-ray → goals and notifications → reports → SME pilot features. The assistant module, guardrails and conversation UI land early; each financial feature ships with its assistant tool and evaluation questions, so the assistant is usable from the first confirmed dataset rather than bolted on at the end |
+| **1. Planning and design** (about month 1) | Requirements, architecture, threat model, acceptance criteria, **AI proof of concept** | This HLD finalised, ADRs, threat model, POPIA control register, calc specification and golden test vectors, API contract v1. **Bank import spike:** CSV parsers for two or three pilot banks, the categorisation cascade on synthetic statements, first accuracy figures. **Ask SFG spike:** local model running, three or four tools over synthetic SME data, first evaluation questions, model shortlist and GPU hosting choice |
+| **2. Development and integration** (about months 2 to 5) | Secure foundations first, then features, with **Ask SFG growing alongside every feature** | Auth + workspaces + audit + upload pipeline → bank statement import and categorisation (more banks, PDF templates) → other extraction and review → calc and X-ray → goals and notifications → reports → SME pilot features. The assistant module, guardrails and conversation UI land early; each financial feature ships with its assistant tool and evaluation questions, so the assistant is usable from the first confirmed dataset rather than bolted on at the end |
 | **3. Validation and pilot readiness** (about month 6) | Testing and go/no-go | Assistant evaluation gate (figure accuracy, tool choice, refusals, helpfulness rated by pilot reviewers) and AI red-team test, pen test and retest, restore test, user testing, documentation, handover, go/no-go |
 
 **Recommended deferrals** to keep release 1 secure and achievable: bank integrations, OCR of scanned documents (unless pilot data shows it is essential), formats beyond PDF/CSV, multi-user business accounts, assistant write actions (it stays read-only), voice input, offline mobile mode, and native-image builds.
@@ -639,3 +723,5 @@ Aligned with the brief's six-month plan. Because AI is the main driver, the assi
 | Q18 | Where will the GPU for the local model run in the pilot: a GPU VM in a South African cloud region (if available), a dedicated GPU server in a South African data centre, or on-premises? | Dev team + Finance Blueprint |
 | Q19 | Which questions must Ask SFG handle well at launch? A list of 30 to 50 real questions from pilot businesses would seed the evaluation set. | Product / Finance Blueprint |
 | Q20 | Who writes and reviews the guidance content the assistant can quote (budgeting, saving, SME cash-flow practice)? | Finance Blueprint |
+| Q21 | Who signs off the personal and business category lists, and do they need to line up with any accounting or tax categories (for example for VAT)? | Finance Blueprint |
+| Q22 | Which banks do the pilot participants use? Can we get synthetic or redacted sample statements (CSV and PDF) for each, to build and test the parsers? | Finance Blueprint |
