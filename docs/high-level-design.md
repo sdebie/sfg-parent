@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.2 for review (v0.2: REST + GraphQL, sfg-infra, Docker Hub CI, sfg-common as the shared Java data library) |
+| **Status** | Draft v0.2 for review (v0.2: REST + GraphQL, sfg-infra, Docker Hub CI, sfg-common as the shared Java data library, local AI assistant) |
 | **Date** | 24 November 2026 |
 | **Source** | *SFG Technical Development, Cybersecurity & Data Protection Brief* (Finance Blueprint (Pty) Ltd, 22 October 2026) |
 | **Scope** | First release and controlled Johannesburg pilot (about 100 participants: 70 individuals, 30 small businesses) |
@@ -36,14 +36,18 @@ From the brief (section 3):
 - Separation of personal and business records, including when one person uses both.
 - Limited decision support suitable for a controlled pilot.
 
+**Ask SFG (core driver)**
+- Customers, especially small business owners, ask questions about their own data in plain language ("How can I save money next month?") and get answers grounded in their figures. AI runs on local models only, so financial data never goes to a cloud AI (section 7).
+
 ### 1.2 Design principles (from brief 3.3 and section 4)
 
 1. **Security and privacy first.** Secure upload and processing come before features. No live pilot with real data until legal/privacy review, controls, testing and approvals are complete.
 2. **Documents in, not bank feeds.** PDF and CSV uploads only. No direct bank integrations and no promise of automatic monitoring in release 1.
-3. **Deterministic numbers.** Every financial figure comes from a deterministic, versioned, tested and auditable calculation engine. AI may explain and suggest, but never calculates the numbers or overrides calculation controls.
+3. **Deterministic numbers.** Every financial figure comes from a deterministic, versioned, tested and auditable calculation engine. AI may explain, answer questions and suggest, but never calculates the numbers or overrides calculation controls.
 4. **Customer in control.** Extracted data is a proposal until the customer confirms it. Suggestions are advice, not decisions.
 5. **No credit-score claims.** Credit-readiness guidance is never presented as a bureau score or a lending decision.
-6. **Proportionate.** Sized for a 100-person pilot. Prefer a small number of well-understood components over a distributed platform.
+6. **Local AI only.** Language models run on SFG-controlled infrastructure in South Africa; customer data is never sent to a cloud AI service.
+7. **Proportionate.** Sized for a 100-person pilot. Prefer a small number of well-understood components over a distributed platform.
 
 ### 1.3 Explicit non-goals for release 1
 
@@ -82,10 +86,10 @@ flowchart LR
     DB[("PostgreSQL<br/>app data + audit log")]
     OBJ[("Object storage<br/>encrypted documents")]
     KMS["Key management<br/>(cloud KMS / Vault)"]
+    LLM["Local LLM server<br/>(vLLM on GPU, no internet egress)"]
   end
 
   subgraph External["Third parties (contracted, minimal data)"]
-    LLM["AI provider<br/>(explanations only)"]
     PUSH["Push (FCM / APNs)"]
     MAIL["Email provider"]
   end
@@ -102,7 +106,7 @@ flowchart LR
   WRK --> AV
   WRK --> OBJ
   WRK --> DB
-  API --> LLM
+  API -- "assistant tools loop" --> LLM
   API --> PUSH
   API --> MAIL
 ```
@@ -119,6 +123,7 @@ flowchart LR
 | Identity | Keycloak (self-hosted) **[Decision]** | Open source, OIDC/PKCE, MFA, runs in docker-compose; avoids per-user SaaS fees and keeps identity data in-region |
 | Async jobs | PostgreSQL-backed job queue (e.g. Quartz/JobRunr or `SKIP LOCKED` table) **[Decision]** | Pilot volumes are tiny; avoids running Kafka/RabbitMQ |
 | Malware scanning | ClamAV sidecar | Uploaded files are untrusted input |
+| AI | Local open-weight LLM served by vLLM (Ollama for dev), called via Quarkus LangChain4j with read-only tools **[Decision]** | Customers can ask questions about their data without any financial data going to a cloud AI (section 7) |
 | Hosting | Containers in a South African cloud region (e.g. AWS af-south-1 or Azure South Africa North) **[Open] Q1** | Keeps personal information in-country, simplifies POPIA section 72 |
 
 ---
@@ -153,7 +158,8 @@ A single Quarkus application, deployed in two roles from the same image: **api**
 | `calc` | **Deterministic calculation engine**: cash flow, debt ratios, savings rate, goal projections, SME cash-flow. Pure functions, `BigDecimal`, versioned, no I/O |
 | `xray` | Assembles the Financial X-ray from `calc` outputs, with evidence links back to source transactions |
 | `goals` | Goal setup, progress tracking, the 30-day review schedule |
-| `guidance` | Rule-based observations and next actions; optional AI-written explanations behind safeguards (section 7) |
+| `guidance` | Rule-based observations and next actions; optional plain-language rewording by the local model (section 7) |
+| `assistant` | "Ask SFG": conversations, tool-calling loop against the local LLM, read-only tools over `calc`/`ledger`/`goals`, guardrails, streaming answers (section 7) |
 | `reports` | Dated PDF reports with period, data used, calc version and limitations |
 | `notifications` | Weekly progress and review reminders via push and email; user preferences |
 | `audit` | Append-only audit log of security and data events |
@@ -174,7 +180,7 @@ Notes:
 
 - Vite + React + TypeScript + Tailwind CSS.
 - Routing by workspace (`/w/:workspaceId/...`) with a clear personal/business switcher and visual distinction between modes.
-- Main areas: onboarding, uploads, review and confirm, Financial X-ray, goals, reports, settings (consent, notifications, data export/deletion).
+- Main areas: onboarding, uploads, review and confirm, Financial X-ray, **Ask SFG** assistant, goals, reports, settings (consent, notifications, data export/deletion).
 - Uses a typed API client generated from the backend's OpenAPI document and GraphQL schema (where it lives: **[Open] Q17**).
 - **Session model [Decision]:** the backend acts as a backend-for-frontend for the web app. Quarkus OIDC handles the login redirect and keeps the session in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie, so access tokens are never exposed to browser JavaScript. Strict Content Security Policy; no third-party scripts or trackers on authenticated pages.
 - Served as static files by nginx (own container image).
@@ -298,7 +304,7 @@ flowchart LR
   D["Confirmed dataset vN"] --> CALC["calc engine vX<br/>(deterministic)"]
   CALC --> FIG["Figures + evidence links"]
   FIG --> RULES["Rule-based observations<br/>& next actions"]
-  FIG --> AI["AI explanation<br/>(optional, de-identified inputs)"]
+  FIG --> AI["Plain-language rewording<br/>(optional, local model)"]
   RULES --> GUARD["Output guardrails<br/>(numbers must match calc, banned claims)"]
   AI --> GUARD
   GUARD --> XRAY["Financial X-ray"]
@@ -363,17 +369,136 @@ Mapped to brief section 4. A formal threat model (STRIDE per data flow above) is
 
 ---
 
-## 7. AI safeguards
+## 7. AI assistant ("Ask SFG") and safeguards
 
-AI is optional and limited to **explaining** results and drafting next-step wording (brief 3.3, section 4).
+### 7.1 Purpose
 
-1. **No numbers from AI.** All figures come from `calc`. AI receives the computed figures and rule-based observations, not raw documents.
-2. **Data minimisation and de-identification.** No names, ID numbers, account numbers, employer names or raw transaction descriptions are sent. Inputs are aggregates and category-level facts.
-3. **Contractual controls.** Provider must offer no training on customer data, zero or minimal retention, a data processing agreement and, ideally, in-region or adequately protected processing (POPIA section 72). Provider choice: **[Open] Q5**.
-4. **Output guardrails.** Generated text is checked before display: any number must match a `calc` value; banned phrasing (credit score, "you qualify", lending decisions, guaranteed outcomes) is blocked; fallback to the rule-based text if checks fail.
-5. **Transparency.** AI-written text is labelled; the customer can see the underlying figures and evidence.
-6. **Logging.** Prompts and outputs are logged in de-identified form for quality review, with the same retention rules as other data.
-7. **Kill switch.** AI explanations can be turned off by configuration without affecting the X-ray.
+The main driver for SFG is that a customer, especially a small business owner, can **ask questions about
+their own data in plain language**, for example:
+
+- "How can I save money next month?"
+- "Why was my cash flow negative in March?"
+- "Which customers owe me the most, and how late are they?"
+- "If I cut my fuel spend by 15%, when do I reach my savings goal?"
+
+The assistant answers using the customer's confirmed data, the deterministic calculation engine and
+curated guidance, and shows the figures and transactions behind every answer. It fits the brief's rule
+that "AI may assist with explanations and guidance, but should not replace calculation controls" (3.3):
+**the model talks, the calculation engine counts.**
+
+It replaces the earlier "explanations only" scope for AI and the plan to defer AI chat.
+
+### 7.2 Local models only [Decision]
+
+**Personal and business financial data never goes to a cloud AI service.** The language model runs on
+infrastructure SFG controls, in South Africa, on a private network with no internet access.
+
+- **Serving:** [vLLM](https://github.com/vllm-project/vllm) in the pilot and staging (efficient batching, OpenAI-compatible API, tool-calling support). [Ollama](https://ollama.com) on developer machines (for example a Mac with Apple Silicon) and in the local compose stack. Both expose the same OpenAI-compatible API, so switching is configuration only.
+- **Integration:** the backend uses the [Quarkus LangChain4j](https://docs.quarkiverse.io/quarkus-langchain4j/dev/) extension with its OpenAI-compatible client pointed at the local server. Tools are plain Java methods on backend services.
+- **Model choice:** open-weight models with strong tool calling and a permissive commercial licence, chosen by running the evaluation set (7.7) on SFG's own synthetic data. Candidates to evaluate, as of late 2026:
+
+| Size class | Example candidates | Typical GPU memory (quantised) | Fit |
+|---|---|---|---|
+| Small (about 7 to 14B) | Qwen3 8B/14B, Llama 3.1 8B, Gemma 3 12B | 16 to 24 GB (e.g. one NVIDIA L4) | Dev and fallback; weaker at multi-step tool use |
+| **Medium (about 20 to 32B, incl. mixture-of-experts)** | gpt-oss-20b, Qwen3 30B-A3B / 32B, Mistral Small 3.x (24B) | 24 to 48 GB (one L4 at 4-bit, comfortably one L40S 48 GB) | **Recommended starting point for the pilot** |
+| Large (70B and up) | Llama 3.3 70B, gpt-oss-120b, Qwen3 235B-A22B | 80 GB and up (A100/H100 class) | Higher quality, out of proportion for 100 users |
+
+Licences must allow commercial use (for example Apache 2.0 for Qwen3, gpt-oss and Mistral Small; Llama has its own community licence). Model weights are downloaded once from the official source, checksummed and stored in SFG's own registry; the serving container never pulls models at runtime.
+
+- **Capacity for the pilot:** 100 participants means a handful of concurrent questions at peak. One GPU running a medium model with vLLM is enough, with a target of first words in under 2 seconds and a full answer in under 15 seconds. Where the GPU is hosted is **[Open] Q18**: GPU instances in South African cloud regions are limited, so options are a GPU VM in-region if available, a dedicated GPU server in a South African data centre, or on-premises hardware.
+
+### 7.3 How a question is answered
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor C as Customer
+  participant App as Web / Mobile
+  participant AS as assistant module (backend)
+  participant LLM as Local LLM (vLLM)
+  participant T as Tools (read-only services)
+  participant CALC as calc engine
+  participant DB as PostgreSQL
+
+  C->>App: "How can I save money next month?"
+  App->>AS: POST /api/v1/assistant/conversations/{id}/messages (streamed reply)
+  AS->>AS: Auth, workspace context, rate limit, scope check
+  AS->>LLM: System rules + question + tool list (no raw data yet)
+  LLM-->>AS: Call get_spending_by_category(last 3 months)
+  AS->>T: Run tool in caller's workspace
+  T->>CALC: Category totals and trends
+  CALC->>DB: Confirmed transactions (RLS-scoped)
+  T-->>AS: Figures with ids
+  LLM-->>AS: Call get_recurring_expenses(), forecast_cashflow(next month)
+  AS->>T: Run tools
+  T-->>AS: Figures with ids
+  LLM-->>AS: Call simulate_scenario(cut "Eating out" 30%, cancel 2 subscriptions)
+  AS->>T: Run scenario
+  T->>CALC: Deterministic projection
+  T-->>AS: Projected saving with ids
+  LLM-->>AS: Draft answer referencing figure ids
+  AS->>AS: Output guardrails (numbers, claims, scope)
+  AS-->>App: Answer + figure cards + "see transactions" links + disclaimer
+```
+
+Key rules:
+
+1. **Tools, not free-form data access.** The model can only call a fixed set of **read-only** tools, each backed by an existing service and the `calc` engine. No text-to-SQL, no access to documents, no write actions. Candidate tools for release 1:
+   - `get_cashflow_summary(period)`, `forecast_cashflow(months)`, `compare_periods(a, b)`
+   - `get_spending_by_category(period, top_n)`, `get_recurring_expenses()`, `search_transactions(filters)` (limited rows, masked identifiers)
+   - `get_debts_summary()`, `get_goal_progress(goal)`
+   - SME: `get_receivables(aging)`, `get_payables(due)`, `get_business_cashflow(period)`
+   - `simulate_scenario(changes, horizon)`: "what if" projections calculated by `calc`, never by the model
+   - `get_guidance(topic)`: curated, reviewed financial-literacy content (retrieval over a small knowledge base, e.g. PostgreSQL with pgvector)
+2. **The workspace comes from the session, never from the model.** Tools take no workspace or user id as a parameter; the backend binds the caller's current workspace, and row-level security (6.2) applies underneath. A personal question cannot see business data and the other way round.
+3. **Numbers only from tools.** Every figure in an answer must match a value returned by a tool in that turn (allowing for formatting). Answers that fail this check are regenerated once, then replaced by a safe fallback that shows the tool results directly.
+4. **Suggestions, not decisions.** Answers propose options with their projected effect; the customer decides (principle 4). Credit-readiness or lending conclusions are not allowed (principle 5).
+5. **Evidence by default.** Each answer shows figure cards linking to the X-ray and the underlying transactions, plus the data period it is based on and that it relies on uploaded data, not live bank feeds.
+
+### 7.4 Components
+
+- **`assistant` module (sfg-backend):** conversation API, orchestration loop (LangChain4j AI service with tools), tool registry, guardrails, streaming responses (Server-Sent Events from a REST endpoint), per-user rate limits and token budgets.
+- **Conversation store:** conversations and messages per workspace in PostgreSQL (entities in sfg-common, tables in sfg-infra), encrypted at rest, subject to the retention schedule (Q3) and deleted with the workspace.
+- **Knowledge base:** reviewed guidance articles (budgeting, saving, debt, SME cash-flow practice) embedded with a local embedding model and stored with pgvector. No customer data in this index.
+- **LLM server:** vLLM container (Ollama locally) on a GPU node, reachable only from the backend.
+- **Clients:** an "Ask SFG" screen in web and mobile with suggested questions, streamed answers and figure cards. Available in both personal and business workspaces, scoped to the one in use.
+
+### 7.5 Safeguards
+
+1. **No cloud AI.** No customer data leaves SFG infrastructure for inference. Any future use of a cloud model would need a new decision, updated consent and a privacy review; it is not planned.
+2. **Network isolation.** The LLM server has no internet egress and accepts connections only from the backend. Its API is not exposed through the reverse proxy.
+3. **Prompt-injection resistance.** Transaction descriptions and invoice text come from uploaded documents and may contain hostile text. Tool output is passed to the model as clearly delimited data; the model has no tools that write, send or reach outside the workspace; answers are rendered as plain text with safe formatting (no raw HTML, no external links or images). A red-team test set covers this (7.7).
+4. **Output guardrails.** Number matching (7.3), blocked claims (credit score, "you qualify", guaranteed returns, tax or legal advice beyond general guidance), scope limits (off-topic questions get a polite refusal), and a standard disclaimer.
+5. **Minimum data per turn.** Tools return aggregates and the few rows needed, with account numbers and ID numbers masked. Even with a local model, the model sees no more than the question needs.
+6. **No training on customer data.** Models are used as downloaded. Any future fine-tuning uses synthetic data, or de-identified data only with explicit consent.
+7. **Logging and review.** Tool calls, guardrail outcomes and latency are logged as metadata. Full prompts and answers are stored only in the encrypted conversation store, not in application logs.
+8. **Transparency.** Answers are labelled as AI-generated; the customer can see the figures and transactions they came from.
+9. **Kill switch.** The assistant can be turned off by configuration without affecting the X-ray, goals or reports.
+
+### 7.6 Local versus cloud models
+
+| | Local (chosen) | Cloud AI API |
+|---|---|---|
+| Privacy and POPIA | Data stays in SFG infrastructure in South Africa; no extra operator or cross-border transfer | Third-party operator, contract and section 72 assessment needed; residual trust in the provider |
+| Answer quality | Good with medium open models when grounded by tools; weaker on complex reasoning | Best available models |
+| Cost | Fixed GPU cost (one GPU server or VM, running whether used or not) | Pay per use; very low at pilot volumes |
+| Operations | SFG runs, patches and monitors the model server and GPU | Provider runs it |
+| Latency and availability | Under SFG's control; one GPU is a single point of failure for the assistant | Depends on provider and internet path |
+| Lock-in | Open weights and an OpenAI-compatible API make models swappable | Tied to provider features and pricing |
+
+The grounding design (tools plus the calc engine) narrows the quality gap, because the model only has to
+choose tools and explain results, not reason about raw numbers.
+
+### 7.7 Evaluation
+
+- **Golden question set:** 100 or more questions across synthetic personal and SME datasets, each with the expected tools and facts. Run on every change of model, prompt or tool, and as a Stage 3 gate.
+- **Measures:** figure accuracy (must be 100% after guardrails), correct tool choice, correct refusals, helpfulness rated by Finance Blueprint reviewers, and latency.
+- **Red-team set:** prompt injection through transaction text, attempts to reach another workspace, requests for credit scores or lending decisions, and off-topic requests.
+
+### 7.8 Other uses of AI
+
+- **Explanations in the X-ray:** the same local model may reword rule-based observations into plain language (5.2), under the same guardrails.
+- **Extraction help:** if used at all, the local model only pre-fills proposals for difficult documents; the customer review step is never skipped (5.1).
 
 ---
 
@@ -384,15 +509,15 @@ Technical support for POPIA controls. **Legal advice and formal compliance sign-
 | POPIA condition / right | Technical support |
 |---|---|
 | Accountability | Named Information Officer (Finance Blueprint, **[Open] Q2**); control register in sfg-parent |
-| Processing limitation and consent | Versioned, recorded consent at onboarding per purpose (processing documents, AI explanations, notifications); withdraw at any time |
+| Processing limitation and consent | Versioned, recorded consent at onboarding per purpose (processing documents, the AI assistant, notifications); withdraw at any time |
 | Purpose specification | Data used only for the customer's own financial-health analysis; no reuse for model training or marketing without separate consent |
-| Further processing | Controls preventing reuse of identifiable documents by AI or third parties (section 7) |
+| Further processing | AI runs on local models only; no customer data to cloud AI, no training on customer data (section 7) |
 | Information quality | Customer review and correction step; editable profile |
 | Openness | In-app privacy notice; report limitations section |
 | Security safeguards (s19) | Section 6 of this document |
 | Data subject participation | Self-service export of personal data and reports; correction; account and workspace deletion with crypto-shredding |
 | Special and children's information | Not collected; onboarding restricted to adults (18+) |
-| Cross-border transfer (s72) | Hosting in South Africa; third parties assessed and contracted |
+| Cross-border transfer (s72) | Hosting, including the AI model server, in South Africa; third parties assessed and contracted |
 | Breach notification (s22) | Incident response plan (6.7) |
 | Retention (s14) | Retention schedule per data type, enforced by scheduled jobs (**[Open] Q3**) |
 
@@ -400,8 +525,8 @@ Technical support for POPIA controls. **Legal advice and formal compliance sign-
 
 ## 9. Testing and assurance
 
-- **In development (included):** unit tests (especially `calc` with golden vectors), API integration tests (Quarkus + Testcontainers), contract tests against the OpenAPI spec, authorization tests that prove workspace isolation, UI tests for web (Playwright) and mobile (Detox or Maestro), dependency and static scanning in CI.
-- **Independent assurance (separate, per brief section 5):** vulnerability assessment and penetration test of web, mobile and API; authentication and session testing; document upload abuse tests (malicious PDFs, oversized files, polyglots); access-control and personal/business separation testing; findings report with severity, remediation and retest.
+- **In development (included):** unit tests (especially `calc` with golden vectors), API integration tests (Quarkus + Testcontainers), contract tests against the OpenAPI spec, authorization tests that prove workspace isolation (including through assistant tools), the assistant evaluation and red-team sets (7.7), UI tests for web (Playwright) and mobile (Detox or Maestro), dependency and static scanning in CI.
+- **Independent assurance (separate, per brief section 5):** vulnerability assessment and penetration test of web, mobile and API; authentication and session testing; document upload abuse tests (malicious PDFs, oversized files, polyglots); assistant abuse tests (prompt injection, cross-workspace attempts); access-control and personal/business separation testing; findings report with severity, remediation and retest.
 - **Pilot readiness:** restore test, incident tabletop exercise, user testing, go/no-go review against measurable acceptance criteria (Stage 3).
 
 ---
@@ -427,6 +552,7 @@ flowchart TB
     BE --> S3[("Object storage")]
     BE --> KC["Keycloak"]
     WK --> CL["ClamAV"]
+    BE --> AI["vLLM on GPU node<br/>(private, no egress)"]
   end
   IMG --> DC
   IMG --> Pilot
@@ -438,7 +564,7 @@ flowchart TB
   - `build-<component>.yml` on push to `main`: compile with Maven (or the JS build), build a small runtime image from a `Dockerfile.runtime` (for the backend, `eclipse-temurin:21-jre-alpine` with the pre-built `target/quarkus-app`), and push it to **Docker Hub** as `<DOCKERHUB_USERNAME>/sfg-<component>:latest` and `:<git sha>`. Needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets.
   - Images: `sfg-backend`, `sfg-infra`, `sfg-frontend`. Mobile builds go to the app stores instead.
 - **Image hygiene [Decision]:** Docker Hub repositories should be **private**, since they hold the application (**[Open] Q15**). Images get a vulnerability scan (e.g. Trivy) before push. sfg-setup pins the `:<sha>` tag for anything beyond local dev; `:latest` is for local convenience only.
-- **Pilot hosting:** container platform in a South African region with managed PostgreSQL, object storage and KMS; exact platform deferred (**[Open] Q1**). A single-host compose deployment is acceptable for staging.
+- **Pilot hosting:** container platform in a South African region with managed PostgreSQL, object storage and KMS, plus one GPU node for the LLM server; exact platform deferred (**[Open] Q1**, GPU hosting **Q18**). Locally, sfg-setup adds an `ollama` service (or uses Ollama installed on the host, which is faster on a Mac). A single-host compose deployment is acceptable for staging.
 - **Mobile distribution:** TestFlight (iOS) and Google Play internal/closed testing for pilot participants.
 - **Configuration and secrets:** environment variables injected from the platform's secret store; nothing secret in repos or images.
 
@@ -450,11 +576,11 @@ Aligned with the brief's six-month plan.
 
 | Stage | Focus | Architecture outputs |
 |---|---|---|
-| **1. Planning and design** (about month 1) | Requirements, architecture, threat model, acceptance criteria | This HLD finalised, ADRs, threat model, POPIA control register, calc specification and golden test vectors, API contract v1 |
-| **2. Development and integration** (about months 2 to 5) | Secure foundations first, then features | Auth + workspaces + audit + upload pipeline → extraction and review → calc and X-ray → goals and notifications → guidance with AI safeguards → reports → SME pilot features |
-| **3. Validation and pilot readiness** (about month 6) | Testing and go/no-go | Pen test and retest, restore test, user testing, documentation, handover, go/no-go |
+| **1. Planning and design** (about month 1) | Requirements, architecture, threat model, acceptance criteria | This HLD finalised, ADRs, threat model, POPIA control register, calc specification and golden test vectors, API contract v1, LLM model shortlist and GPU hosting choice |
+| **2. Development and integration** (about months 2 to 5) | Secure foundations first, then features | Auth + workspaces + audit + upload pipeline → extraction and review → calc and X-ray → goals and notifications → Ask SFG assistant with local LLM and guardrails → reports → SME pilot features |
+| **3. Validation and pilot readiness** (about month 6) | Testing and go/no-go | Assistant evaluation gate, pen test and retest, restore test, user testing, documentation, handover, go/no-go |
 
-**Recommended deferrals** to keep release 1 secure and achievable: bank integrations, OCR of scanned documents (unless pilot data shows it is essential), formats beyond PDF/CSV, multi-user business accounts, in-app chat with AI, offline mobile mode, and native-image builds.
+**Recommended deferrals** to keep release 1 secure and achievable: bank integrations, OCR of scanned documents (unless pilot data shows it is essential), formats beyond PDF/CSV, multi-user business accounts, assistant write actions (it stays read-only), voice input, offline mobile mode, and native-image builds.
 
 ---
 
@@ -466,7 +592,7 @@ Aligned with the brief's six-month plan.
 | Q2 | Who is the Information Officer, and who provides legal/POPIA review and sign-off? | Finance Blueprint |
 | Q3 | Retention periods for original documents, extracted data, reports, audit logs and closed accounts? | Finance Blueprint + legal |
 | Q4 | Must release 1 handle scanned PDFs/photos (OCR, camera capture), or other formats such as XLSX/OFX? Which banks and payroll formats are in scope for the pilot? | Product |
-| Q5 | Will AI explanations be in release 1, and which provider meets the no-training / retention / transfer requirements? | Product + security |
+| ~~Q5~~ | ~~AI provider~~ **Answered:** AI is core (Ask SFG) and runs on local open-weight models only; no cloud AI (section 7). | Shawn |
 | Q6 | Accepted MFA methods (TOTP, passkeys, SMS fallback)? | Security |
 | Q7 | React Native workflow: Expo (managed with dev client) or bare React Native? | Dev team |
 | ~~Q8~~ | ~~Exact scope of sfg-common~~ **Answered:** a shared Java library holding enums, entities, DTOs and repositories; it owns the DB model (section 3.4). | Shawn |
@@ -493,3 +619,6 @@ Aligned with the brief's six-month plan.
 | 5 Independent testing | 9 |
 | 6 Delivery approach | 11 |
 | 7 Development scope items (IP, hosting, licences) | 3, 10; commercial items out of scope for this HLD |
+| Q18 | Where will the GPU for the local model run in the pilot: a GPU VM in a South African cloud region (if available), a dedicated GPU server in a South African data centre, or on-premises? | Dev team + Finance Blueprint |
+| Q19 | Which questions must Ask SFG handle well at launch? A list of 30 to 50 real questions from pilot businesses would seed the evaluation set. | Product / Finance Blueprint |
+| Q20 | Who writes and reviews the guidance content the assistant can quote (budgeting, saving, SME cash-flow practice)? | Finance Blueprint |
