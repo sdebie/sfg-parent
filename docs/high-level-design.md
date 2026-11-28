@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.2 for review (v0.2: REST + GraphQL, sfg-infra, Docker Hub CI, sfg-common as the shared Java data library, local AI assistant) |
+| **Status** | Draft v0.2 for review (v0.2: REST + GraphQL, sfg-infra, Docker Hub CI, sfg-common as the shared Java data library, local AI assistant; 2026-11-28: backend runs the sfg-infra migrations at startup) |
 | **Date** | 24 November 2026 |
 | **Source** | *SFG Technical Development, Cybersecurity & Data Protection Brief* (Finance Blueprint (Pty) Ltd, 22 October 2026) |
 | **Scope** | First release and controlled Johannesburg pilot (about 100 participants: 70 individuals, 30 small businesses) |
@@ -94,8 +94,7 @@ flowchart LR
 
   subgraph Platform
     IDP["Identity provider<br/>(Keycloak, OIDC)"]
-    MIG["DB migrations, one-shot<br/>(sfg-infra: Flyway as sfg_owner)"]
-    API["SFG API<br/>(sfg-backend: Quarkus, DB role sfg_app)"]
+    API["SFG API<br/>(sfg-backend: Quarkus, DB role sfg_app;<br/>runs sfg-infra Flyway migrations at startup as sfg_owner)"]
     WRK["Document workers<br/>(same codebase, worker profile)"]
     AV["Malware scanner<br/>(ClamAV)"]
     DB[("PostgreSQL<br/>app data + audit log")]
@@ -132,7 +131,7 @@ flowchart LR
 |---|---|---|
 | Backend | Quarkus (Java 21 LTS) | Stated in project setup; strong OIDC, security and native-image support |
 | API style | REST (`/api/v1`, OpenAPI) **and** GraphQL (`/api/graphql`, SmallRye GraphQL) over one shared service layer | REST for simple, cacheable and file-upload calls; GraphQL lets the X-ray and dashboard screens fetch exactly what they need in one round trip |
-| Schema migrations | Flyway, owned and run by the separate **sfg-infra** repo as a one-shot job before the backend starts | Schema changes are reviewed and versioned on their own; the backend can't change the schema, and Hibernate never generates DDL |
+| Schema migrations | Flyway SQL migrations kept in the separate **sfg-infra** repo and run by sfg-backend at startup, with the schema owner's login (same pattern as SolarTrack) | Schema changes are reviewed and versioned on their own; no separate migration container; the app's own connection can't change the schema, and Hibernate never generates DDL |
 | Database | PostgreSQL 16 | Relational integrity for financial data; row-level security for tenant separation |
 | Document storage | S3-compatible object storage (MinIO locally, cloud bucket in pilot) | Keeps large binaries out of the DB; per-object encryption and lifecycle rules |
 | Identity | Keycloak (self-hosted) **[Decision]** | Open source, OIDC/PKCE, MFA, runs in docker-compose; avoids per-user SaaS fees and keeps identity data in-region |
@@ -150,7 +149,7 @@ All repositories live at `github.com/sdebie`.
 | Repo | Purpose | Main contents |
 |---|---|---|
 | **sfg-parent** | Project documentation and cross-repo decisions | This HLD, architecture decision records (`docs/adr/`), threat model, security and POPIA control register, roadmap |
-| **sfg-infra** | Database schema and local database | Flyway migrations (`db/migration`), dev seed data (`db/seed/dev`), a `docker-compose.yml` for a local PostgreSQL. Owns the schema and the database roles, and runs the migrations as a one-shot job before the backend starts |
+| **sfg-infra** | Database schema and local database | Flyway migrations (`db/migration`), dev seed data (`db/seed/dev`), a `docker-compose.yml` for a local PostgreSQL. Owns the schema and the database roles. Publishes the migrations as a jar that sfg-backend runs at startup |
 | **sfg-setup** | Run the whole system locally and for the pilot | `docker-compose.yml`, env templates, startup and seed scripts. Compose **pulls** published images (details deferred) |
 | **sfg-common** | Shared Java library and owner of the data model | Enums, JPA entities, DTOs and Panache repositories, published as a Maven artifact |
 | **sfg-backend** | The SFG API and document workers | Quarkus application (REST + GraphQL), services, calculation engine. Uses the entities, DTOs and repositories from sfg-common; no DDL |
@@ -183,7 +182,7 @@ A single Quarkus application, deployed in two roles from the same image: **api**
 
 Notes:
 - **Calculation engine discipline.** `calc` has no dependency on frameworks or AI. Each run records the engine version and a hash of its inputs, so any figure in a report can be reproduced. Golden test vectors (agreed with Finance Blueprint) gate every change.
-- **Persistence.** Hibernate ORM with Panache, with `quarkus.hibernate-orm.database.generation=none`. Entities, enums and repositories come from sfg-common (3.4); the DDL comes only from sfg-infra (3.6), which applies it before the backend starts. The backend connects as `sfg_app`, which can read and write data but not change the schema. All workspace-owned tables carry `workspace_id`.
+- **Persistence.** Hibernate ORM with Panache, with `quarkus.hibernate-orm.database.generation=validate`. Entities, enums and repositories come from sfg-common (3.4); the DDL comes only from sfg-infra's migrations (3.6), which the backend's Flyway applies at startup as `sfg_owner`. The app's connection pool uses `sfg_app`, which can read and write data but not change the schema. All workspace-owned tables carry `workspace_id`.
 - **APIs.** Two front doors onto the same services:
   - **REST/JSON** under `/api/v1` (JAX-RS), with OpenAPI generated by SmallRye OpenAPI at `/q/openapi` and published to sfg-common. Used for uploads, downloads (reports), commands and anything that benefits from plain HTTP semantics.
   - **GraphQL** at `/api/graphql` (SmallRye GraphQL). Used for read-heavy screens such as the Financial X-ray, goals and dashboards. Mutations are allowed where they mirror a REST command.
@@ -224,29 +223,29 @@ on the Java side.
 How it fits with the other repos:
 - **Build and publish:** a Maven jar (`org.sfg.common:sfg-common`) with a Jandex index so Quarkus apps discover its entities and repository beans. `build.yml` builds it on PRs; `publish-common.yml` deploys it to GitHub Packages on push to `main`.
 - **sfg-backend** depends on it as a Maven dependency (or a local `mvn install` during development) and keeps only services, mappers and API resources. Backend CI reads the package from GitHub Packages (see 10 for the token it needs). sfg-common must be published before a backend change that needs it can pass CI.
-- **sfg-infra** holds the Flyway migrations (DDL). sfg-common entities and sfg-infra migrations must change together: a change that adds a column lands as an sfg-infra migration plus the matching sfg-common entity change, released in that order. **[Decision]** Keep a drift check: backend tests apply the published sfg-infra migrations to a throwaway database (test scope only) and run Hibernate in `validate` mode, so a missing or renamed column fails the build.
+- **sfg-infra** holds the Flyway migrations (DDL). sfg-common entities and sfg-infra migrations must change together: a change that adds a column lands as an sfg-infra migration plus the matching sfg-common entity change, released in that order. **[Decision]** Drift check: the backend applies the sfg-infra migrations and runs Hibernate in `validate` mode, in its tests (throwaway Dev Services database) and at every startup, so a missing or renamed column fails the build or the start.
 - **Web and mobile** cannot use a Java library. Their TypeScript types come from the backend's OpenAPI document and GraphQL schema instead; where that generated client lives is **[Open] Q17**.
 
 ### 3.5 sfg-setup
 
-- `docker-compose.yml` that pulls published images from Docker Hub for: `backend-api`, `backend-worker`, `frontend`, `postgres`, `keycloak`, `minio`, `clamav`, and for local use only `mailpit` (fake email)., plus an `infra` service that runs the Flyway migrations and exits. The backend starts only after `infra` has finished successfully (3.6).
+- `docker-compose.yml` that pulls published images from Docker Hub for: `backend-api`, `backend-worker`, `frontend`, `postgres`, `keycloak`, `minio`, `clamav`, `ollama`, and for local use only `mailpit` (fake email). There is no separate migration service: the backend migrates the database as it starts (3.6).
 - `.env.example` with every setting documented; no real secrets committed.
-- Startup scripts: create buckets, import the Keycloak realm, load synthetic seed data. Migrations are run by the sfg-infra job, which can also load the dev seed locally.
+- Startup scripts: create buckets, import the Keycloak realm, load synthetic seed data. Migrations run inside the backend at startup; sfg-infra's local runner can also load the dev seed.
 - The same compose definition can run a single-host pilot environment with production overrides, or be translated to the chosen cloud platform later (details deferred, see section 10).
 
 ### 3.6 sfg-infra (database schema)
 
 - **Owns the PostgreSQL schema.** Versioned Flyway migrations in `src/main/resources/db/migration` (starting with `V1.0.0__initial_schema.sql`) and synthetic seed data in `db/seed/dev`, which is never applied outside dev and test.
-- **Local database:** its `docker-compose.yml` starts PostgreSQL 16 for development (`sfg_db`, user `sfg`).
+- **Local database:** its `docker-compose.yml` starts PostgreSQL 16 for development (`sfg_db`, roles `sfg_owner` and `sfg_app`).
 - **Packaging:** sfg-infra publishes its migrations to GitHub Packages as a Maven artifact (`org.sfg.infra:sfg-infra:<version>:migrations`).
-- **Applying migrations (decided):** sfg-infra is the owner of the schema. Its Flyway runner applies the migrations as a **one-shot job before the backend starts**, in compose and in the pilot, then exits. The backend does not run migrations. Row-level security policies (6.2) also arrive as sfg-infra migrations.
-- **Database roles (decided):**
-  - `sfg_owner` owns the schema and tables and is used only by the migration job.
-  - `sfg_app` is the role the backend connects as. It has data access only (`SELECT`, `INSERT`, `UPDATE`, `DELETE` on the application tables, granted by the migrations) and cannot create or alter tables.
+- **Applying migrations (decided 2026-11-28, replaces the one-shot job):** as in SolarTrack, sfg-backend depends on the sfg-infra migrations jar and runs Flyway at startup (`quarkus.flyway.migrate-at-start=true`), in compose and in the pilot. Flyway takes a database lock, so several backend instances starting together is safe. A new migration reaches an environment with the next backend image. Row-level security policies (6.2) also arrive as sfg-infra migrations.
+- **Database roles (decided):** roles are created outside Flyway (sfg-setup's init script, or the DBA in hosted environments), because they are cluster-wide and carry passwords.
+  - `sfg_owner` owns the schema and tables. The backend uses it only for Flyway at startup (`quarkus.flyway.username`), never for requests.
+  - `sfg_app` is the role the backend's connection pool uses for all requests. It has data access only (`SELECT`, `INSERT`, `UPDATE`, `DELETE` on the application tables, granted by the migrations) and cannot create or alter tables.
   - Because `sfg_app` does not own the tables, row-level security applies to it without needing `FORCE ROW LEVEL SECURITY`.
-- **Who owns what:** sfg-infra owns the database (schema, roles, grants, RLS policies); sfg-common owns the Java side (entities and the repositories that access the database).
+- **Who owns what:** sfg-infra owns the database definition (schema, grants, RLS policies) as migrations; sfg-common owns the data access layer (entities, enums, DTOs and the repositories that access the database); sfg-backend holds the datasource configuration and runs the migrations.
 - **Relationship to sfg-common:** sfg-infra owns the DDL, sfg-common owns the entities that map it (3.4). Backend tests catch any drift.
-- **How the backend tests get a schema:** see the drift check in 3.4. If the tests read a migrations artifact from GitHub Packages, backend CI needs a `PACKAGES_READ_TOKEN` secret (a classic PAT with `read:packages`) while sfg-infra is private.
+- **How the backend gets the migrations:** as the Maven dependency `org.sfg.infra:sfg-infra:<version>:migrations` from GitHub Packages. While sfg-infra is private, backend CI needs a `PACKAGES_TOKEN` secret (a classic PAT with `read:packages`).
 - **Rules for schema changes:** migrations are forward-only and never edited after merge; a backend change that needs a new column merges the sfg-infra migration first; destructive changes go through expand-then-contract across two releases.
 
 ---
@@ -644,10 +643,9 @@ flowchart TB
   end
   subgraph Pilot["Pilot environment (South African region)"]
     LB["TLS load balancer / WAF"] --> FE["frontend (nginx)"]
-    MG["sfg-infra migrations<br/>(one-shot, sfg_owner)"] --> PG
     LB --> BE["backend-api"]
     BE --> WK["backend-worker"]
-    BE --> PG[("Managed PostgreSQL")]
+    BE -->|"app: sfg_app<br/>Flyway at startup: sfg_owner"| PG[("Managed PostgreSQL")]
     BE --> S3[("Object storage")]
     BE --> KC["Keycloak"]
     WK --> CL["ClamAV"]
@@ -660,10 +658,10 @@ flowchart TB
 - **Environments:** local (compose, synthetic data), test/staging (synthetic data only), pilot (real data, only after go/no-go).
 - **CI pattern (per repo, GitHub Actions):**
   - `build.yml` on every pull request: build and run the tests. sfg-backend reads sfg-common from GitHub Packages and validates the entities against the sfg-infra migrations (3.4, 3.6).
-  - sfg-infra: builds the migration runner image (and, if the backend tests use it, a migrations jar for GitHub Packages).
+  - sfg-infra: publishes the migrations jar to GitHub Packages on push to `main`; the backend picks it up on its next build.
   - sfg-common: `publish-common.yml` deploys the jar to GitHub Packages on push to `main`.
   - `build-<component>.yml` on push to `main`: compile with Maven (or the JS build), build a small runtime image from a `Dockerfile.runtime` (for the backend, `eclipse-temurin:21-jre-alpine` with the pre-built `target/quarkus-app`), and push it to **Docker Hub** as `<DOCKERHUB_USERNAME>/sfg-<component>:latest` and `:<git sha>`. Needs `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` secrets.
-  - Images: `sfg-backend`, `sfg-infra` (one-shot migration runner), `sfg-frontend`. Mobile builds go to the app stores instead.
+  - Images: `sfg-backend` (bundles the migrations), `sfg-frontend`. Mobile builds go to the app stores instead.
 - **Image hygiene [Decision]:** Docker Hub repositories should be **private**, since they hold the application (**[Open] Q15**). Images get a vulnerability scan (e.g. Trivy) before push. sfg-setup pins the `:<sha>` tag for anything beyond local dev; `:latest` is for local convenience only.
 - **Pilot hosting:** container platform in a South African region with managed PostgreSQL, object storage and KMS, plus one GPU node for the LLM server; exact platform deferred (**[Open] Q1**, GPU hosting **Q18**). Locally, sfg-setup adds an `ollama` service (or uses Ollama installed on the host, which is faster on a Mac). A single-host compose deployment is acceptable for staging.
 - **Mobile distribution:** TestFlight (iOS) and Google Play internal/closed testing for pilot participants.
